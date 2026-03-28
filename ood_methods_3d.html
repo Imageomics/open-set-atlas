@@ -164,6 +164,7 @@ canvas { display: block; }
     <span style="font-size:11px; color:#6b7280;">Test points:</span>
     <label><input type="radio" name="ood-set" value="far" checked> Low-confidence</label>
     <label><input type="radio" name="ood-set" value="near"> Boundary</label>
+    <button id="ood-random" style="font-size:11px; padding:2px 8px; border-radius:4px; cursor:pointer; border:0.5px solid #c7cbd1; background:transparent; color:#6b7280; margin-left:4px;">Random &#x21bb;</button>
   </div>
   <div class="main-row">
     <div class="viz-col">
@@ -2958,7 +2959,8 @@ function updateDecisionTable(mode) {
   if (mode === "none") { oodDiv.innerHTML = ""; return; }
   const isNear = activeOodPoints === nearOodPoints;
   const ptColor = "#E24B4A";
-  const setLabel = isNear ? "Boundary" : "Low-confidence";
+  const isRandom = activeOodPoints === randomOodPoints;
+  const setLabel = isRandom ? "Random" : (isNear ? "Boundary" : "Low-confidence");
   if (cpModes.has(mode)) {
     const logitsFn = mode === "cp-fc" ? fc.logitsFn : protoLogitsFn;
     const qhat = conformalCalibrateScore(logitsFn, cpAlpha, cpScoreType);
@@ -3197,6 +3199,7 @@ function clearProbe() {
 const oodLegendDesc = document.getElementById("ood-legend-desc");
 document.querySelectorAll('input[name="ood-set"]').forEach(radio => {
   radio.addEventListener("change", function() {
+    randomOodGroup.visible = false;
     if (this.value === "far") {
       farOodGroup.visible = true;
       nearOodGroup.visible = false;
@@ -3210,6 +3213,53 @@ document.querySelectorAll('input[name="ood-set"]').forEach(radio => {
     }
     updateDecisionTable(activeMode);
   });
+});
+
+// ── Random test points ──
+var randomOodGroup = new THREE.Group();
+randomOodGroup.visible = false;
+scene.add(randomOodGroup);
+var randomOodPoints = [];
+
+function generateRandomOodPoints() {
+  // Clear old markers
+  while (randomOodGroup.children.length) randomOodGroup.remove(randomOodGroup.children[0]);
+  randomOodPoints.length = 0;
+  // Generate 4 random points on S²
+  for (var ri = 0; ri < 4; ri++) {
+    var th = Math.acos(2 * Math.random() - 1);
+    var ph = 2 * Math.PI * Math.random();
+    randomOodPoints.push([Math.sin(th) * Math.cos(ph), Math.cos(th), Math.sin(th) * Math.sin(ph)]);
+  }
+  // Build markers (same style as far-OOD)
+  randomOodGroup.add(makePointCloud(randomOodPoints, "#E24B4A", 0.055));
+  randomOodPoints.forEach(function(p, k) {
+    var c2 = document.createElement("canvas");
+    c2.width = 64; c2.height = 64;
+    var ctx3 = c2.getContext("2d");
+    ctx3.fillStyle = "#E24B4A";
+    ctx3.font = "bold 48px Inter, system-ui, sans-serif";
+    ctx3.textAlign = "center"; ctx3.textBaseline = "middle";
+    ctx3.fillText(String(k + 1), 32, 32);
+    var tex2 = new THREE.CanvasTexture(c2);
+    var mat2 = new THREE.SpriteMaterial({ map: tex2, transparent: true, depthWrite: false });
+    var sprite2 = new THREE.Sprite(mat2);
+    sprite2.position.set(p[0] * 1.12, p[1] * 1.12, p[2] * 1.12);
+    sprite2.scale.set(0.08, 0.08, 1);
+    randomOodGroup.add(sprite2);
+  });
+}
+
+document.getElementById("ood-random").addEventListener("click", function() {
+  // Deselect radio buttons
+  document.querySelectorAll('input[name="ood-set"]').forEach(function(r) { r.checked = false; });
+  farOodGroup.visible = false;
+  nearOodGroup.visible = false;
+  generateRandomOodPoints();
+  randomOodGroup.visible = true;
+  activeOodPoints = randomOodPoints;
+  oodLegendDesc.textContent = "random points on S\u00B2";
+  updateDecisionTable(activeMode);
 });
 
 // ── q slider wiring (Feature 3) ──
