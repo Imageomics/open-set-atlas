@@ -2047,6 +2047,18 @@ rotValInput.addEventListener("blur", function() {
 });
 document.getElementById("zoom-reset").addEventListener("click", () => { camDist = 3.2; panX = 0; panY = 0; });
 
+function lookAtPoint(pt) {
+  // Compute rotX, rotY so camera faces the point. Pause rotation.
+  rotY = Math.atan2(pt[0], pt[2]);
+  rotX = Math.asin(Math.max(-1, Math.min(1, pt[1])));
+  panX = 0; panY = 0;
+  rotSpeed = 0;
+  var rs = document.getElementById("rot-speed");
+  var rv2 = document.getElementById("rot-speed-val");
+  if (rs) rs.value = 0;
+  if (rv2) rv2.value = "0.0";
+}
+
 function animate() {
   requestAnimationFrame(animate);
   if (!dragging) rotY += rotSpeed;
@@ -2976,7 +2988,7 @@ function updateDecisionTable(mode) {
         ? { type: "cos", items: classes.map((c, i) => ({ l: c.label, c: c.color, v: cosSims[i] })) }
         : { type: "prob", items: classes.map((c, i) => ({ l: c.label, c: c.color, v: probs[i] })) };
       return `<tr>
-        <td style="color:${ptColor}; font-weight:700">${k + 1}</td>
+        <td style="color:${ptColor}; font-weight:700; cursor:pointer;" class="pt-link" data-pt-idx="${k}">${k + 1}</td>
         <td>${setHtml}</td>
         <td><span class="formula">|C| = ${predSet.length}</span></td>
         <td>${predSet.length === 0 ? '<span class="decision-rejected">\u2717 OOD</span>' : '<span class="decision-accepted" style="color:' + classes[predSet[0]].color + '">\u2713 ' + predSet.map(ci => classes[ci].label).join(', ') + '</span>'}</td>
@@ -3024,7 +3036,7 @@ function updateDecisionTable(mode) {
       : `<span class="decision-rejected">\u2717 rejected (OOD)</span>`;
     const cs = classScores3d(x, mode);
     return `<tr>
-      <td style="color:${ptColor}; font-weight:700">${k + 1}</td>
+      <td style="color:${ptColor}; font-weight:700; cursor:pointer;" class="pt-link" data-pt-idx="${k}">${k + 1}</td>
       <td><span class="formula">${d.val.toFixed(3)}</span></td>
       <td><span class="formula">${d.val.toFixed(3)} ${comp} ${d.thr.toFixed(3)}</span></td>
       <td>${decisionHtml}</td>
@@ -3059,6 +3071,15 @@ function updateDecisionTable(mode) {
     <tbody>${rows.join("")}</tbody>
   </table>`;
 }
+
+// ── Click point labels to rotate camera ──
+oodDiv.addEventListener("click", function(e) {
+  var td = e.target.closest(".pt-link");
+  if (!td) return;
+  var idx = parseInt(td.dataset.ptIdx);
+  if (isNaN(idx) || idx < 0 || idx >= activeOodPoints.length) return;
+  lookAtPoint(activeOodPoints[idx]);
+});
 
 // ── UI ──
 const desc = document.getElementById("desc");
