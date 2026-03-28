@@ -1135,12 +1135,13 @@ if (!PRE) {
     return null;
   }, layers.msp);
 
-  // Per-class cosine texture
+  // Per-class cosine texture (ratio-based overlap resolution)
   makeMethodSphere((p) => {
-    let best = null, bestScore = -Infinity;
-    for (const c of classes) {
-      const s = v3dot(p, c.muHat);
-      if (s >= c.cosThreshold && s > bestScore) { best = c; bestScore = s; }
+    let best = null, bestRatio = -Infinity;
+    for (let ci = 0; ci < classes.length; ci++) {
+      const s = v3dot(p, classes[ci].muHat);
+      const ratio = classes[ci].cosThreshold !== 0 ? s / classes[ci].cosThreshold : s;
+      if (s >= classes[ci].cosThreshold && ratio > bestRatio) { best = classes[ci]; bestRatio = ratio; }
     }
     return best ? { color: best.color, opacity: 0.55 } : null;
   }, layers.cos);
@@ -1493,10 +1494,11 @@ function makeFCTextures(variant, parentGroups) {
     return pr[a] >= variant.tsGamma ? { color: classes[a].color, opacity: 0.55 } : null;
   }
   function evalCos(p) {
-    let best = null, bestScore = -Infinity;
+    let best = null, bestRatio = -Infinity;
     for (let ci = 0; ci < classes.length; ci++) {
       const s = v3dot(p, variant.wDirs[ci]);
-      if (s >= variant.fcCosThresholds[ci] && s > bestScore) { best = classes[ci]; bestScore = s; }
+      const ratio = variant.fcCosThresholds[ci] !== 0 ? s / variant.fcCosThresholds[ci] : s;
+      if (s >= variant.fcCosThresholds[ci] && ratio > bestRatio) { best = classes[ci]; bestRatio = ratio; }
     }
     return best ? { color: best.color, opacity: 0.55 } : null;
   }
@@ -2367,10 +2369,11 @@ function getMethodEvalFn(method, thr) {
       return null;
     };
     case "cos": return (p) => {
-      let best2 = null, bestS2 = -Infinity;
+      let best2 = null, bestR2 = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = v3dot(p, classes[ci].muHat);
-        if (s >= thr.cosPerClass[ci] && s > bestS2) { best2 = classes[ci]; bestS2 = s; }
+        const ratio = thr.cosPerClass[ci] !== 0 ? s / thr.cosPerClass[ci] : s;
+        if (s >= thr.cosPerClass[ci] && ratio > bestR2) { best2 = classes[ci]; bestR2 = ratio; }
       }
       return best2 ? { color: best2.color, opacity: 0.55 } : null;
     };
@@ -2453,10 +2456,11 @@ function getMethodEvalFn(method, thr) {
       return null;
     };
     case "fc-cos": return (p) => {
-      let best2 = null, bestS2 = -Infinity;
+      let best2 = null, bestR2 = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = v3dot(p, fc.wDirs[ci]);
-        if (s >= thr.fcCosPerClass[ci] && s > bestS2) { best2 = classes[ci]; bestS2 = s; }
+        const ratio = thr.fcCosPerClass[ci] !== 0 ? s / thr.fcCosPerClass[ci] : s;
+        if (s >= thr.fcCosPerClass[ci] && ratio > bestR2) { best2 = classes[ci]; bestR2 = ratio; }
       }
       return best2 ? { color: best2.color, opacity: 0.55 } : null;
     };
