@@ -1152,27 +1152,26 @@ if (!PRE) {
     const ctx = canvas.getContext("2d");
     const imgData = ctx.createImageData(TEX_W, TEX_H);
     const pixels = imgData.data;
-    const bandOpacities = [0.18, 0.35, 0.55];
     for (let py2 = 0; py2 < TEX_H; py2++) {
       for (let px2 = 0; px2 < TEX_W; px2++) {
-        const u = px2 / TEX_W; const v = py2 / TEX_H;
-        const dir = dirFromUV(u, v);
+        const dir = dirFromUV(px2 / TEX_W, py2 / TEX_H);
         const idx = (py2 * TEX_W + px2) * 4;
-        let bestColor = null, bestOpacity = 0;
-        for (let band = 0; band < 3; band++) {
-          let best = null, bestScore = -Infinity;
-          for (const c of classes) {
-            const s = c.kappa * v3dot(dir, c.muHat);
-            if (s >= c.vmBands[band] && s > bestScore) { best = c; bestScore = s; }
+        let bestCI = -1, bestRatio = -Infinity, bestS = 0;
+        for (let ci = 0; ci < classes.length; ci++) {
+          const s = classes[ci].kappa * v3dot(dir, classes[ci].muHat);
+          const thrVal = classes[ci].vmBands[0];
+          if (s >= thrVal) {
+            const ratio = thrVal !== 0 ? s / thrVal : s;
+            if (ratio > bestRatio) { bestCI = ci; bestRatio = ratio; bestS = s; }
           }
-          if (best) { bestColor = best.color; bestOpacity = bandOpacities[band]; }
         }
-        if (bestColor) {
-          const [r, g, b] = hexToRGB(bestColor);
+        if (bestCI >= 0) {
+          const maxS = Math.max(...classes[bestCI].vmScores);
+          const thrVal = classes[bestCI].vmBands[0];
+          const t = maxS > thrVal ? (bestS - thrVal) / (maxS - thrVal) : 1;
+          const [r, g, b] = hexToRGB(classes[bestCI].color);
           pixels[idx] = r; pixels[idx+1] = g; pixels[idx+2] = b;
-          pixels[idx+3] = Math.round(bestOpacity * 255);
-        } else {
-          pixels[idx] = 0; pixels[idx+1] = 0; pixels[idx+2] = 0; pixels[idx+3] = 0;
+          pixels[idx+3] = Math.round((0.10 + 0.50 * Math.min(1, t)) * 255);
         }
       }
     }
@@ -1191,24 +1190,26 @@ if (!PRE) {
     const ctx = canvas.getContext("2d");
     const imgData = ctx.createImageData(TEX_W, TEX_H);
     const pixels = imgData.data;
-    const bandOpacities = [0.18, 0.35, 0.55];
     for (let py2 = 0; py2 < TEX_H; py2++) {
       for (let px2 = 0; px2 < TEX_W; px2++) {
         const dir = dirFromUV(px2 / TEX_W, py2 / TEX_H);
         const idx = (py2 * TEX_W + px2) * 4;
-        let bestColor = null, bestOpacity = 0;
-        for (let band = 0; band < 3; band++) {
-          let best = null, bestScore = -Infinity;
-          for (const c of classes) {
-            const s = c.kent.kentScore(dir);
-            if (s >= c.kent.bands[band] && s > bestScore) { best = c; bestScore = s; }
+        let bestCI = -1, bestRatio = -Infinity, bestS = 0;
+        for (let ci = 0; ci < classes.length; ci++) {
+          const s = classes[ci].kent.kentScore(dir);
+          const thrVal = classes[ci].kent.bands[0];
+          if (s >= thrVal) {
+            const ratio = thrVal !== 0 ? s / thrVal : s;
+            if (ratio > bestRatio) { bestCI = ci; bestRatio = ratio; bestS = s; }
           }
-          if (best) { bestColor = best.color; bestOpacity = bandOpacities[band]; }
         }
-        if (bestColor) {
-          const [r, g, b] = hexToRGB(bestColor);
+        if (bestCI >= 0) {
+          const maxS = Math.max(...classes[bestCI].kentScores);
+          const thrVal = classes[bestCI].kent.bands[0];
+          const t = maxS > thrVal ? (bestS - thrVal) / (maxS - thrVal) : 1;
+          const [r, g, b] = hexToRGB(classes[bestCI].color);
           pixels[idx] = r; pixels[idx+1] = g; pixels[idx+2] = b;
-          pixels[idx+3] = Math.round(bestOpacity * 255);
+          pixels[idx+3] = Math.round((0.10 + 0.50 * Math.min(1, t)) * 255);
         }
       }
     }
@@ -1500,30 +1501,38 @@ function makeFCTextures(variant, parentGroups) {
     return best ? { color: best.color, opacity: 0.55 } : null;
   }
   function evalVmf(p) {
-    let bestColor = null, bestOpacity = 0;
-    const bandOpacities = [0.18, 0.35, 0.55];
-    for (let band = 0; band < 3; band++) {
-      let best = null, bestScore = -Infinity;
-      for (let ci = 0; ci < classes.length; ci++) {
-        const s = variant.fcKappas[ci] * v3dot(p, variant.wDirs[ci]);
-        if (s >= variant.fcVmBands[ci][band] && s > bestScore) { best = classes[ci]; bestScore = s; }
+    let bestCI = -1, bestRatio = -Infinity, bestS = 0;
+    for (let ci = 0; ci < classes.length; ci++) {
+      const s = variant.fcKappas[ci] * v3dot(p, variant.wDirs[ci]);
+      const thrVal = variant.fcVmBands[ci][0];
+      if (s >= thrVal) {
+        const ratio = thrVal !== 0 ? s / thrVal : s;
+        if (ratio > bestRatio) { bestCI = ci; bestRatio = ratio; bestS = s; }
       }
-      if (best) { bestColor = best.color; bestOpacity = bandOpacities[band]; }
     }
-    return bestColor ? { color: bestColor, opacity: bestOpacity } : null;
+    if (bestCI < 0) return null;
+    const scores = classes[bestCI].points.map(pt => variant.fcKappas[bestCI] * v3dot(pt, variant.wDirs[bestCI]));
+    const maxS = Math.max(...scores);
+    const thrVal = variant.fcVmBands[bestCI][0];
+    const t = maxS > thrVal ? (bestS - thrVal) / (maxS - thrVal) : 1;
+    return { color: classes[bestCI].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
   }
   function evalKent(p) {
-    let bestColor = null, bestOpacity = 0;
-    const bandOpacities = [0.18, 0.35, 0.55];
-    for (let band = 0; band < 3; band++) {
-      let best = null, bestScore = -Infinity;
-      for (let ci = 0; ci < classes.length; ci++) {
-        const s = variant.fcKents[ci].kentScore(p);
-        if (s >= variant.fcKents[ci].bands[band] && s > bestScore) { best = classes[ci]; bestScore = s; }
+    let bestCI = -1, bestRatio = -Infinity, bestS = 0;
+    for (let ci = 0; ci < classes.length; ci++) {
+      const s = variant.fcKents[ci].kentScore(p);
+      const thrVal = variant.fcKents[ci].bands[0];
+      if (s >= thrVal) {
+        const ratio = thrVal !== 0 ? s / thrVal : s;
+        if (ratio > bestRatio) { bestCI = ci; bestRatio = ratio; bestS = s; }
       }
-      if (best) { bestColor = best.color; bestOpacity = bandOpacities[band]; }
     }
-    return bestColor ? { color: bestColor, opacity: bestOpacity } : null;
+    if (bestCI < 0) return null;
+    const scores = classes[bestCI].points.map(pt => variant.fcKents[bestCI].kentScore(pt));
+    const maxS = Math.max(...scores);
+    const thrVal = variant.fcKents[bestCI].bands[0];
+    const t = maxS > thrVal ? (bestS - thrVal) / (maxS - thrVal) : 1;
+    return { color: classes[bestCI].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
   }
   const evals = { "fc-msp": evalMSP, "fc-mls": evalMLS, "fc-ebo": evalEBO, "fc-ts": evalTS, "fc-cos": evalCos, "fc-vmf": evalVmf, "fc-kent": evalKent };
   for (const key of ["fc-msp", "fc-mls", "fc-ebo", "fc-ts", "fc-cos", "fc-vmf", "fc-kent"]) {
@@ -2366,28 +2375,36 @@ function getMethodEvalFn(method, thr) {
       return best2 ? { color: best2.color, opacity: 0.55 } : null;
     };
     case "vmf": return (p) => {
-      let bestColor2 = null, bestOpacity2 = 0;
-      for (let band = 0; band < 3; band++) {
-        let best2 = null, bestScore2 = -Infinity;
-        for (let ci = 0; ci < classes.length; ci++) {
-          const s = classes[ci].kappa * v3dot(p, classes[ci].muHat);
-          if (s >= thr.vmfBands[ci][band] && s > bestScore2) { best2 = classes[ci]; bestScore2 = s; }
+      let best2 = -1, bestRatio2 = -Infinity, bestS2 = 0;
+      for (let ci = 0; ci < classes.length; ci++) {
+        const s = classes[ci].kappa * v3dot(p, classes[ci].muHat);
+        const thrVal = thr.vmfBands[ci][0];
+        if (s >= thrVal) {
+          const ratio = thrVal !== 0 ? s / thrVal : s;
+          if (ratio > bestRatio2) { best2 = ci; bestRatio2 = ratio; bestS2 = s; }
         }
-        if (best2) { bestColor2 = best2.color; bestOpacity2 = bandOpacities[band]; }
       }
-      return bestColor2 ? { color: bestColor2, opacity: bestOpacity2 } : null;
+      if (best2 < 0) return null;
+      const maxS = Math.max(...classes[best2].vmScores);
+      const thrVal = thr.vmfBands[best2][0];
+      const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
+      return { color: classes[best2].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
     };
     case "kent": return (p) => {
-      let bestColor2 = null, bestOpacity2 = 0;
-      for (let band = 0; band < 3; band++) {
-        let best2 = null, bestScore2 = -Infinity;
-        for (let ci = 0; ci < classes.length; ci++) {
-          const s = classes[ci].kent.kentScore(p);
-          if (s >= thr.kentBands[ci][band] && s > bestScore2) { best2 = classes[ci]; bestScore2 = s; }
+      let best2 = -1, bestRatio2 = -Infinity, bestS2 = 0;
+      for (let ci = 0; ci < classes.length; ci++) {
+        const s = classes[ci].kent.kentScore(p);
+        const thrVal = thr.kentBands[ci][0];
+        if (s >= thrVal) {
+          const ratio = thrVal !== 0 ? s / thrVal : s;
+          if (ratio > bestRatio2) { best2 = ci; bestRatio2 = ratio; bestS2 = s; }
         }
-        if (best2) { bestColor2 = best2.color; bestOpacity2 = bandOpacities[band]; }
       }
-      return bestColor2 ? { color: bestColor2, opacity: bestOpacity2 } : null;
+      if (best2 < 0) return null;
+      const maxS = Math.max(...classes[best2].kentScores);
+      const thrVal = thr.kentBands[best2][0];
+      const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
+      return { color: classes[best2].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
     };
     case "knn": return (p) => {
       const r = knnResult(p);
@@ -2444,28 +2461,38 @@ function getMethodEvalFn(method, thr) {
       return best2 ? { color: best2.color, opacity: 0.55 } : null;
     };
     case "fc-vmf": return (p) => {
-      let bestColor2 = null, bestOpacity2 = 0;
-      for (let band = 0; band < 3; band++) {
-        let best2 = null, bestScore2 = -Infinity;
-        for (let ci = 0; ci < classes.length; ci++) {
-          const s = fc.fcKappas[ci] * v3dot(p, fc.wDirs[ci]);
-          if (s >= thr.fcVmfBands[ci][band] && s > bestScore2) { best2 = classes[ci]; bestScore2 = s; }
+      let best2 = -1, bestRatio2 = -Infinity, bestS2 = 0;
+      for (let ci = 0; ci < classes.length; ci++) {
+        const s = fc.fcKappas[ci] * v3dot(p, fc.wDirs[ci]);
+        const thrVal = thr.fcVmfBands[ci][0];
+        if (s >= thrVal) {
+          const ratio = thrVal !== 0 ? s / thrVal : s;
+          if (ratio > bestRatio2) { best2 = ci; bestRatio2 = ratio; bestS2 = s; }
         }
-        if (best2) { bestColor2 = best2.color; bestOpacity2 = bandOpacities[band]; }
       }
-      return bestColor2 ? { color: bestColor2, opacity: bestOpacity2 } : null;
+      if (best2 < 0) return null;
+      const fcVmScores = classes[best2].points.map(pt => fc.fcKappas[best2] * v3dot(pt, fc.wDirs[best2]));
+      const maxS = Math.max(...fcVmScores);
+      const thrVal = thr.fcVmfBands[best2][0];
+      const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
+      return { color: classes[best2].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
     };
     case "fc-kent": return (p) => {
-      let bestColor2 = null, bestOpacity2 = 0;
-      for (let band = 0; band < 3; band++) {
-        let best2 = null, bestScore2 = -Infinity;
-        for (let ci = 0; ci < classes.length; ci++) {
-          const s = fc.fcKents[ci].kentScore(p);
-          if (s >= thr.fcKentBands[ci][band] && s > bestScore2) { best2 = classes[ci]; bestScore2 = s; }
+      let best2 = -1, bestRatio2 = -Infinity, bestS2 = 0;
+      for (let ci = 0; ci < classes.length; ci++) {
+        const s = fc.fcKents[ci].kentScore(p);
+        const thrVal = thr.fcKentBands[ci][0];
+        if (s >= thrVal) {
+          const ratio = thrVal !== 0 ? s / thrVal : s;
+          if (ratio > bestRatio2) { best2 = ci; bestRatio2 = ratio; bestS2 = s; }
         }
-        if (best2) { bestColor2 = best2.color; bestOpacity2 = bandOpacities[band]; }
       }
-      return bestColor2 ? { color: bestColor2, opacity: bestOpacity2 } : null;
+      if (best2 < 0) return null;
+      const fcKScores = classes[best2].points.map(pt => fc.fcKents[best2].kentScore(pt));
+      const maxS = Math.max(...fcKScores);
+      const thrVal = thr.fcKentBands[best2][0];
+      const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
+      return { color: classes[best2].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
     };
     default: return null;
   }
@@ -2576,30 +2603,36 @@ function oodDecision3d(x, method) {
       return { score: "log-den.", val: r.density, thr: thr.kdeThr, lo: false, cls: r.bestClass };
     }
     case "cos": {
-      let best = -1, bestS = -Infinity;
+      let best = -1, bestRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = v3dot(x, classes[ci].muHat);
-        if (s >= thr.cosPerClass[ci] && s > bestS) { best = ci; bestS = s; }
+        const ratio = thr.cosPerClass[ci] !== 0 ? s / thr.cosPerClass[ci] : s;
+        if (s >= thr.cosPerClass[ci] && ratio > bestRatio) { best = ci; bestRatio = ratio; }
       }
-      let nearCls = 0, maxCos = -Infinity;
+      let nearCls = 0, maxRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = v3dot(x, classes[ci].muHat);
-        if (s > maxCos) { maxCos = s; nearCls = ci; }
+        const ratio = thr.cosPerClass[ci] !== 0 ? s / thr.cosPerClass[ci] : s;
+        if (ratio > maxRatio) { maxRatio = ratio; nearCls = ci; }
       }
-      return { score: "max cos", val: maxCos, thr: thr.cosPerClass[nearCls], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
+      const nearS = v3dot(x, classes[nearCls].muHat);
+      return { score: "max cos", val: nearS, thr: thr.cosPerClass[nearCls], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
     }
     case "vmf": {
-      let best = -1, bestS = -Infinity;
+      let best = -1, bestRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = classes[ci].kappa * v3dot(x, classes[ci].muHat);
-        if (s >= thr.vmfBands[ci][0] && s > bestS) { best = ci; bestS = s; }
+        const ratio = thr.vmfBands[ci][0] !== 0 ? s / thr.vmfBands[ci][0] : s;
+        if (s >= thr.vmfBands[ci][0] && ratio > bestRatio) { best = ci; bestRatio = ratio; }
       }
-      let nearCls = 0, maxS = -Infinity;
+      let nearCls = 0, maxRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = classes[ci].kappa * v3dot(x, classes[ci].muHat);
-        if (s > maxS) { maxS = s; nearCls = ci; }
+        const ratio = thr.vmfBands[ci][0] !== 0 ? s / thr.vmfBands[ci][0] : s;
+        if (ratio > maxRatio) { maxRatio = ratio; nearCls = ci; }
       }
-      return { score: "\u03BA\u00B7cos", val: maxS, thr: thr.vmfBands[nearCls][0], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
+      const nearS = classes[nearCls].kappa * v3dot(x, classes[nearCls].muHat);
+      return { score: "\u03BA\u00B7cos", val: nearS, thr: thr.vmfBands[nearCls][0], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
     }
     case "msp":
       return { score: "max P", val: probs[pArgmax], thr: thr.mspGamma, lo: false, cls: pArgmax };
@@ -2655,56 +2688,68 @@ function oodDecision3d(x, method) {
       return { score: "ViM E", val: r.energy, thr: thr.fcVimThr, lo: false, cls: r.argmax };
     }
     case "fc-cos": {
-      let best = -1, bestS = -Infinity;
+      let best = -1, bestRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = v3dot(x, fc.wDirs[ci]);
-        if (s >= thr.fcCosPerClass[ci] && s > bestS) { best = ci; bestS = s; }
+        const ratio = thr.fcCosPerClass[ci] !== 0 ? s / thr.fcCosPerClass[ci] : s;
+        if (s >= thr.fcCosPerClass[ci] && ratio > bestRatio) { best = ci; bestRatio = ratio; }
       }
-      let nearCls = 0, maxCos = -Infinity;
+      let nearCls = 0, maxRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = v3dot(x, fc.wDirs[ci]);
-        if (s > maxCos) { maxCos = s; nearCls = ci; }
+        const ratio = thr.fcCosPerClass[ci] !== 0 ? s / thr.fcCosPerClass[ci] : s;
+        if (ratio > maxRatio) { maxRatio = ratio; nearCls = ci; }
       }
-      return { score: "max cos", val: maxCos, thr: thr.fcCosPerClass[nearCls], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
+      const nearS = v3dot(x, fc.wDirs[nearCls]);
+      return { score: "max cos", val: nearS, thr: thr.fcCosPerClass[nearCls], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
     }
     case "fc-vmf": {
-      let best = -1, bestS = -Infinity;
+      let best = -1, bestRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = fc.fcKappas[ci] * v3dot(x, fc.wDirs[ci]);
-        if (s >= thr.fcVmfBands[ci][0] && s > bestS) { best = ci; bestS = s; }
+        const ratio = thr.fcVmfBands[ci][0] !== 0 ? s / thr.fcVmfBands[ci][0] : s;
+        if (s >= thr.fcVmfBands[ci][0] && ratio > bestRatio) { best = ci; bestRatio = ratio; }
       }
-      let nearCls = 0, maxS = -Infinity;
+      let nearCls = 0, maxRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = fc.fcKappas[ci] * v3dot(x, fc.wDirs[ci]);
-        if (s > maxS) { maxS = s; nearCls = ci; }
+        const ratio = thr.fcVmfBands[ci][0] !== 0 ? s / thr.fcVmfBands[ci][0] : s;
+        if (ratio > maxRatio) { maxRatio = ratio; nearCls = ci; }
       }
-      return { score: "\u03BA\u00B7cos", val: maxS, thr: thr.fcVmfBands[nearCls][0], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
+      const nearS = fc.fcKappas[nearCls] * v3dot(x, fc.wDirs[nearCls]);
+      return { score: "\u03BA\u00B7cos", val: nearS, thr: thr.fcVmfBands[nearCls][0], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
     }
     case "kent": {
-      let best = -1, bestS = -Infinity;
+      let best = -1, bestRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = classes[ci].kent.kentScore(x);
-        if (s >= thr.kentBands[ci][0] && s > bestS) { best = ci; bestS = s; }
+        const ratio = thr.kentBands[ci][0] !== 0 ? s / thr.kentBands[ci][0] : s;
+        if (s >= thr.kentBands[ci][0] && ratio > bestRatio) { best = ci; bestRatio = ratio; }
       }
-      let nearCls = 0, maxS = -Infinity;
+      let nearCls = 0, maxRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = classes[ci].kent.kentScore(x);
-        if (s > maxS) { maxS = s; nearCls = ci; }
+        const ratio = thr.kentBands[ci][0] !== 0 ? s / thr.kentBands[ci][0] : s;
+        if (ratio > maxRatio) { maxRatio = ratio; nearCls = ci; }
       }
-      return { score: "kent", val: maxS, thr: thr.kentBands[nearCls][0], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
+      const nearS = classes[nearCls].kent.kentScore(x);
+      return { score: "kent", val: nearS, thr: thr.kentBands[nearCls][0], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
     }
     case "fc-kent": {
-      let best = -1, bestS = -Infinity;
+      let best = -1, bestRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = fc.fcKents[ci].kentScore(x);
-        if (s >= thr.fcKentBands[ci][0] && s > bestS) { best = ci; bestS = s; }
+        const ratio = thr.fcKentBands[ci][0] !== 0 ? s / thr.fcKentBands[ci][0] : s;
+        if (s >= thr.fcKentBands[ci][0] && ratio > bestRatio) { best = ci; bestRatio = ratio; }
       }
-      let nearCls = 0, maxS = -Infinity;
+      let nearCls = 0, maxRatio = -Infinity;
       for (let ci = 0; ci < classes.length; ci++) {
         const s = fc.fcKents[ci].kentScore(x);
-        if (s > maxS) { maxS = s; nearCls = ci; }
+        const ratio = thr.fcKentBands[ci][0] !== 0 ? s / thr.fcKentBands[ci][0] : s;
+        if (ratio > maxRatio) { maxRatio = ratio; nearCls = ci; }
       }
-      return { score: "kent", val: maxS, thr: thr.fcKentBands[nearCls][0], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
+      const nearS = fc.fcKents[nearCls].kentScore(x);
+      return { score: "kent", val: nearS, thr: thr.fcKentBands[nearCls][0], lo: false, cls: nearCls, accepted: best >= 0, acceptCls: best };
     }
     default: return null;
   }
