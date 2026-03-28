@@ -460,6 +460,14 @@ function quantile(arr, q) {
   if (lo === hi) return xs[lo];
   return xs[lo]*(1-(pos-lo)) + xs[hi]*(pos-lo);
 }
+// Fast quantile on a pre-sorted array (no copy, no sort)
+function quantileSorted(sorted, q) {
+  if (sorted.length <= 1) return sorted[0] || 0;
+  var pos = (sorted.length-1)*q;
+  var lo = Math.floor(pos), hi = Math.ceil(pos);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo]*(1-(pos-lo)) + sorted[hi]*(pos-lo);
+}
 
 function softmax(z) {
   const m = Math.max(...z);
@@ -1563,7 +1571,13 @@ fcMarkers.visible = false;
 scene.add(fcMarkers);
 
 function rebuildFCMarkers() {
-  while (fcMarkers.children.length) fcMarkers.remove(fcMarkers.children[0]);
+  // Dispose old GPU resources before removing
+  for (var i = fcMarkers.children.length - 1; i >= 0; i--) {
+    var child = fcMarkers.children[i];
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) child.material.dispose();
+    fcMarkers.remove(child);
+  }
   for (const c of classes) {
     const m = new THREE.Mesh(new THREE.SphereGeometry(0.020, 10, 10),
       new THREE.MeshBasicMaterial({ color: new THREE.Color(c.color), transparent: true, opacity: 0.35 }));
@@ -1649,83 +1663,35 @@ function protoLogitsFn(x) {
   return W.map(w => TAU * v3dot(x, w));
 }
 
-// ── Conformal texture cache + Web Worker background precomputation ──
-const cpCache = new Map();
+// ── Conformal calibration + key functions ──
 
-function cpCacheKey(mode, scoreType, alpha, balanced) {
-  if (scoreType === "emb") return "cp-proto-emb-" + alpha.toFixed(2);
-  return mode + "-" + scoreType + "-" + alpha.toFixed(2) + "-" + balanced;
+function _cpShaderKey(mode, scoreType, balanced) {
+  if (scoreType === "emb") return "cp-emb";
+  if (mode === "cp-proto") return "cp-proto-" + scoreType;
+  return "cp-fc-" + scoreType + "-" + balanced;
 }
 
-function pixelBufToMesh(buf, w, h) {
-  const canvas = document.createElement("canvas");
-  canvas.width = w; canvas.height = h;
-  const ctx = canvas.getContext("2d");
-  const imgData = ctx.createImageData(w, h);
-  imgData.data.set(new Uint8ClampedArray(buf));
-  ctx.putImageData(imgData, 0, 0);
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.wrapS = THREE.RepeatWrapping;
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  return new THREE.Mesh(
-    new THREE.SphereGeometry(1.005, 128, 64),
-    new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.FrontSide, depthWrite: false })
-  );
-}
+// Precomputed sorted calibration scores for instant qhat lookup
+var _cpCalibScores = new Map();
 
-// ── Inline Web Worker (Blob URL so it works from file://) ──
-const workerCode = `
-"use strict";
-// Pure-math functions duplicated for the worker (no DOM access)
-function v3dot(a,b) { return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
-function softmax(z) {
-  const m = Math.max(...z);
-  const ex = z.map(v => Math.exp(v-m));
-  const s = ex.reduce((a,b) => a+b, 0);
-  return ex.map(v => v/s);
-}
-function quantile(arr, q) {
-  const xs = [...arr].sort((a,b) => a-b);
-  if (xs.length <= 1) return xs[0] || 0;
-  const pos = (xs.length-1)*q;
-  const lo = Math.floor(pos), hi = Math.ceil(pos);
-  if (lo === hi) return xs[lo];
-  return xs[lo]*(1-(pos-lo)) + xs[hi]*(pos-lo);
-}
-function hexToRGB(hex) {
-  return [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)];
-}
-
-let cfg = null; // set by "init" message
-
-function dirFromUV(u, v) {
-  const phi = u * 2 * Math.PI;
-  const theta = v * Math.PI;
-  const sinT = Math.sin(theta);
-  return [-sinT * Math.cos(phi), Math.cos(theta), sinT * Math.sin(phi)];
-}
-
-function getLogitsFn(mode, balanced) {
-  if (mode === "cp-fc") {
-    const fcData = balanced ? cfg.fcBal : cfg.fcUnbal;
-    return (x) => fcData.W.map((w, ci) => v3dot(w, x) + fcData.B[ci]);
-  }
-  return (x) => cfg.protoW.map(w => cfg.TAU * v3dot(w, x));
-}
-
-function calibrate(logitsFn, alpha, scoreType) {
-  const scores = [];
-  for (let ci = 0; ci < cfg.classMuHats.length; ci++) {
-    for (const p of cfg.classPoints[ci]) {
+function _cpEnsureCalibScores(mode, scoreType, balanced) {
+  var key = _cpShaderKey(mode, scoreType, balanced);
+  if (_cpCalibScores.has(key)) return _cpCalibScores.get(key);
+  var logitsFn = (mode === "cp-fc")
+    ? (balanced ? fcBal : fcUnbal).logitsFn
+    : protoLogitsFn;
+  var scores = [];
+  for (var ci = 0; ci < classes.length; ci++) {
+    for (var pi = 0; pi < classes[ci].points.length; pi++) {
+      var p = classes[ci].points[pi];
       if (scoreType === "emb") {
-        scores.push(1 - v3dot(p, cfg.classMuHats[ci]));
+        scores.push(1 - v3dot(p, classes[ci].muHat));
       } else {
-        const probs = softmax(logitsFn(p));
+        var probs = softmax(logitsFn(p));
         if (scoreType === "aps") {
-          const sorted = probs.map((pr, k) => ({pr, k})).sort((a,b) => b.pr - a.pr);
-          let cum = 0;
-          for (const s of sorted) { cum += s.pr; if (s.k === ci) break; }
+          var sorted = probs.map(function(pr, k) { return { pr: pr, k: k }; }).sort(function(a, b) { return b.pr - a.pr; });
+          var cum = 0;
+          for (var si = 0; si < sorted.length; si++) { cum += sorted[si].pr; if (sorted[si].k === ci) break; }
           scores.push(cum);
         } else {
           scores.push(1 - probs[ci]);
@@ -1733,240 +1699,47 @@ function calibrate(logitsFn, alpha, scoreType) {
       }
     }
   }
-  const n = scores.length;
-  const level = Math.min(1, Math.ceil((n + 1) * (1 - alpha)) / n);
-  return quantile(scores, level);
+  scores.sort(function(a, b) { return a - b; });
+  _cpCalibScores.set(key, scores);
+  return scores;
 }
 
-function predict(probs, cosSims, qhat, scoreType) {
-  if (scoreType === "emb") {
-    const thr = 1 - qhat;
-    return cosSims.map((s, k) => ({s, k})).filter(o => o.s >= thr).map(o => o.k);
-  } else if (scoreType === "aps") {
-    const sorted = probs.map((pr, k) => ({pr, k})).sort((a,b) => b.pr - a.pr);
-    const set = []; let cum = 0;
-    for (const s of sorted) { set.push(s.k); cum += s.pr; if (cum >= qhat) break; }
-    return set;
-  } else {
-    const thr = 1 - qhat;
-    return probs.map((pr, k) => ({pr, k})).filter(s => s.pr >= thr).map(s => s.k);
-  }
+function _cpQhat(mode, scoreType, balanced, alpha) {
+  var scores = _cpEnsureCalibScores(mode, scoreType, balanced);
+  var n = scores.length;
+  var level = Math.min(1, Math.ceil((n + 1) * (1 - alpha)) / n);
+  return quantileSorted(scores, level);
 }
 
-function computeTexture(task) {
-  const { mode, scoreType, alpha, balanced, texW, texH } = task;
-  const logitsFn = getLogitsFn(mode, balanced);
-  const qhat = calibrate(logitsFn, alpha, scoreType);
-  const buf = new Uint8Array(texW * texH * 4);
-
-  for (let py = 0; py < texH; py++) {
-    for (let px = 0; px < texW; px++) {
-      const dir = dirFromUV(px / texW, py / texH);
-      const probs = softmax(logitsFn(dir));
-      const cosSims = cfg.classMuHats.map(mu => v3dot(dir, mu));
-      const predSet = predict(probs, cosSims, qhat, scoreType);
-      const idx = (py * texW + px) * 4;
-      if (predSet.length > 0) {
-        let top = predSet[0];
-        if (scoreType === "emb") {
-          for (const ci of predSet) if (cosSims[ci] > cosSims[top]) top = ci;
-        } else {
-          for (const ci of predSet) if (probs[ci] > probs[top]) top = ci;
-        }
-        const [r, g, b] = hexToRGB(cfg.classColors[top]);
-        const opacity = predSet.length === 1 ? 0.55 : 0.20;
-        buf[idx] = r; buf[idx+1] = g; buf[idx+2] = b;
-        buf[idx+3] = Math.round(opacity * 255);
-      }
-    }
-  }
-  return buf.buffer;
-}
-
-self.onmessage = function(e) {
-  if (e.data.type === "init") {
-    cfg = e.data.cfg;
-    return;
-  }
-  if (e.data.type === "compute") {
-    const task = e.data.task;
-    const buf = computeTexture(task);
-    self.postMessage({ type: "result", key: task.key, buf, texW: task.texW, texH: task.texH }, [buf]);
-  }
-};
-`;
-
-// Spawn workers (use navigator.hardwareConcurrency, cap at 4)
-const NUM_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2);
-const cpWorkers = [];
-const workerBlob = new Blob([workerCode], { type: "application/javascript" });
-const workerURL = URL.createObjectURL(workerBlob);
-
-// Prepare serializable training data for workers
-const workerCfg = {
-  TAU,
-  protoW: W.map(w => [...w]),
-  classMuHats: classes.map(c => [...c.muHat]),
-  classColors: classes.map(c => c.color),
-  classPoints: classes.map(c => c.points.map(p => [...p])),
-  fcBal: { W: fcBal.W.map(w => [...w]), B: [...fcBal.B] },
-  fcUnbal: { W: fcUnbal.W.map(w => [...w]), B: [...fcUnbal.B] }
-};
-
-for (let i = 0; i < NUM_WORKERS; i++) {
-  const w = new Worker(workerURL);
-  w.postMessage({ type: "init", cfg: workerCfg });
-  w.onmessage = function(e) {
-    if (e.data.type === "result") {
-      const { key, buf, texW, texH } = e.data;
-      if (!cpCache.has(key)) {
-        cpCache.set(key, pixelBufToMesh(buf, texW, texH));
-      }
-      // If this is what the user is currently viewing, show it and clear spinner
-      if (cpModes.has(activeMode)) {
-        const activeKey = cpCacheKey(activeMode, cpScoreType, cpAlpha, fcBalanced);
-        if (key === activeKey) {
-          const g = layers[activeMode];
-          while (g.children.length) g.remove(g.children[0]);
-          g.add(cpCache.get(key));
-          cpHideSpinner();
-        }
-      }
-      cpUpdateCacheBar();
-      // Pull next task from queue
-      cpDispatchNext(w);
-    }
-  };
-  cpWorkers.push(w);
-}
-
-// Task queue for workers
-let cpTaskQueue = [];
-
-function cpDispatchNext(worker) {
-  while (cpTaskQueue.length > 0) {
-    const task = cpTaskQueue.shift();
-    if (!cpCache.has(task.key)) {
-      worker.postMessage({ type: "compute", task });
-      return;
-    }
-  }
-  // Queue empty — nothing to dispatch
-}
-
-function cpEnqueueAll() {
-  _cpCacheDone = false;
-  var apb = document.getElementById("alpha-play");
-  if (apb) { apb.style.display = "none"; if (typeof _alphaPlaying !== "undefined") { _alphaPlaying = false; clearTimeout(_alphaPlayTimer); apb.innerHTML = "\u25B6"; } }
-  cpTaskQueue = [];
-  const alphas = [];
-  for (let a = 1; a <= 30; a++) alphas.push(a / 100);
-  const scoreTypes = ["aps", "msp", "emb"];
-  const modes = ["cp-proto", "cp-fc"];
-  const balancedStates = [true, false];
-
-  // Priority: current settings first, then expand outward
-  // 1. Current scoreType, current balanced, all alphas, both modes
-  for (const alpha of alphas) {
-    for (const mode of modes) {
-      const key = cpCacheKey(mode, cpScoreType, alpha, fcBalanced);
-      if (!cpCache.has(key)) cpTaskQueue.push({ mode, scoreType: cpScoreType, alpha, balanced: fcBalanced, key, texW: TEX_W, texH: TEX_H });
-    }
-  }
-  // 2. Other score types, current balanced
-  for (const st of scoreTypes) {
-    if (st === cpScoreType) continue;
-    for (const alpha of alphas) {
-      for (const mode of modes) {
-        const key = cpCacheKey(mode, st, alpha, fcBalanced);
-        if (!cpCache.has(key)) cpTaskQueue.push({ mode, scoreType: st, alpha, balanced: fcBalanced, key, texW: TEX_W, texH: TEX_H });
-      }
-    }
-  }
-  // 3. Other balanced state
-  const otherBal = !fcBalanced;
-  for (const st of scoreTypes) {
-    for (const alpha of alphas) {
-      for (const mode of modes) {
-        const key = cpCacheKey(mode, st, alpha, otherBal);
-        if (!cpCache.has(key)) cpTaskQueue.push({ mode, scoreType: st, alpha, balanced: otherBal, key, texW: TEX_W, texH: TEX_H });
-      }
-    }
-  }
-  // Dispatch to idle workers
-  for (const w of cpWorkers) cpDispatchNext(w);
-}
-
+// -- Alpha play button state -------------------------------------------------
 const cpAlphaLabel = document.getElementById("cp-alpha-label");
 const cpAlphaSliderEl = document.getElementById("cp-alpha");
 
-// Show cache progress directly on the alpha slider track via CSS gradient.
-// Each of 30 alpha values (0.01..0.30) maps to a segment of the track.
-// Cached = colored, uncached = gray.
-let _cpCacheDone = false;
-function cpSetTrackStyle(bg) {
-  let styleEl = document.getElementById("cp-alpha-track-style");
-  if (!styleEl) {
-    styleEl = document.createElement("style");
-    styleEl.id = "cp-alpha-track-style";
-    document.head.appendChild(styleEl);
-  }
-  styleEl.textContent =
-    "#cp-alpha::-webkit-slider-runnable-track { background: " + bg + " !important; transition: background 0.5s; }" +
-    "#cp-alpha::-moz-range-track { background: " + bg + " !important; transition: background 0.5s; }";
-}
-
 function cpUpdateCacheBar() {
-  if (_cpCacheDone) return;
-  const mode = cpModes.has(activeMode) ? activeMode : "cp-proto";
-  const stops = [];
-  let cached = 0;
-  for (let i = 0; i < 30; i++) {
-    const alpha = ((i + 1) / 100).toFixed(2);
-    const key = cpCacheKey(mode, cpScoreType, parseFloat(alpha), fcBalanced);
-    const isCached = cpCache.has(key);
-    if (isCached) cached++;
-    const color = isCached ? "rgba(91,108,255,0.5)" : "#eceef0";
-    const pct0 = ((i / 30) * 100).toFixed(1);
-    const pct1 = (((i + 1) / 30) * 100).toFixed(1);
-    stops.push(color + " " + pct0 + "%, " + color + " " + pct1 + "%");
-  }
-  if (cached === 30) {
-    _cpCacheDone = true;
-    cpSetTrackStyle("#4ade80");
-    setTimeout(() => { cpSetTrackStyle("#a0a8b0"); document.getElementById("alpha-play").style.display = ""; }, 1000);
-    return;
-  }
-  cpSetTrackStyle("linear-gradient(to right, " + stops.join(", ") + ")");
+  // Conformal methods are always procedural — always ready
+  document.getElementById("alpha-play").style.display = "";
 }
 
-function cpShowSpinner() {
-  cpAlphaLabel.innerHTML = '<span class="cp-spinner"></span>';
-}
 function cpHideSpinner() {
   cpAlphaLabel.innerHTML = "\u03B1:";
 }
 
 function drawConformal(mode) {
-  const g = layers[mode];
-  while (g.children.length) g.remove(g.children[0]);
+  var g = layers[mode];
+  var key = _cpShaderKey(mode, cpScoreType, fcBalanced);
 
-  const key = cpCacheKey(mode, cpScoreType, cpAlpha, fcBalanced);
-  if (cpCache.has(key)) {
-    g.add(cpCache.get(key));
-    cpHideSpinner();
-    return;
+  // PROCEDURAL PATH: conformal methods render instantly via GPU shader
+  if (!_cpProceduralCache.has(key)) {
+    _buildConformalProceduralMesh(mode, cpScoreType, fcBalanced);
   }
-
-  // Not cached yet — show spinner and request high-priority computation
-  cpShowSpinner();
-  const task = { mode, scoreType: cpScoreType, alpha: cpAlpha, balanced: fcBalanced, key, texW: TEX_W, texH: TEX_H };
-  cpTaskQueue.unshift(task);
-  for (const w of cpWorkers) cpDispatchNext(w);
+  var entry = _cpProceduralCache.get(key);
+  if (g.children.indexOf(entry.mesh) < 0) {
+    while (g.children.length) g.remove(g.children[0]);
+    g.add(entry.mesh);
+  }
+  _updateConformalProceduralUniforms(mode);
+  cpUpdateCacheBar();
 }
-
-// Start background precomputation after initial render
-// Conformal precomputation starts after the q background sweep finishes (see bgPrecompute).
 
 // ── orbit controls ──
 let camDist = 3.2;
@@ -2246,45 +2019,89 @@ if (PRE) {
 }
 
 // ── allThresholds: recompute all thresholds at a given q (Feature 3) ──
+// Pre-sort all training score arrays for O(1) quantile lookups.
+// Also pre-compute FC training scores (were being recomputed on every q change).
+var _sortedTrainMsp = trainMsp.map(function(xs) { return xs.slice().sort(function(a,b){return a-b}); });
+var _sortedMLSscores = trainMLSscores.slice().sort(function(a,b){return a-b});
+var _sortedEBOscores = trainEBOscores.slice().sort(function(a,b){return a-b});
+var _sortedTSMSP = trainTSMSP.map(function(xs) { return xs.slice().sort(function(a,b){return a-b}); });
+var _sortedCosScores = classes.map(function(c) { return c.cosScores.slice().sort(function(a,b){return a-b}); });
+var _sortedVmScores = classes.map(function(c) { return c.vmScores.slice().sort(function(a,b){return a-b}); });
+var _sortedKentScores = classes.map(function(c) { return c.kentScores.slice().sort(function(a,b){return a-b}); });
+var _sortedMahalPC = trainMahalPC.slice().sort(function(a,b){return a-b});
+var _sortedMahalS = trainMahalS.slice().sort(function(a,b){return a-b});
+var _sortedKNNdists = trainKNNdists.slice().sort(function(a,b){return a-b});
+var _sortedRMDS = trainRMDS.slice().sort(function(a,b){return a-b});
+var _sortedKDEscores = trainKDEscores.slice().sort(function(a,b){return a-b});
+var _sortedOdinPerClass = _storedOdinPerClass.map(function(xs) { return xs.slice().sort(function(a,b){return a-b}); });
+var _sortedVimScores = _storedTrainVimScores.slice().sort(function(a,b){return a-b});
+
+// Pre-compute FC training scores (these depend on the current FC variant)
+function _buildSortedFCScores() {
+  var fcMspPerClass = classes.map(function(c, i) {
+    return c.points.map(function(p) { return softmax(fc.logitsFn(p))[i]; }).sort(function(a,b){return a-b});
+  });
+  var fcMlsScores = fcTrainX.map(function(p) { return Math.max.apply(null, fc.logitsFn(p)); }).sort(function(a,b){return a-b});
+  var fcEboScores = fcTrainX.map(function(p) { return logsumexp(fc.logitsFn(p)); }).sort(function(a,b){return a-b});
+  var fcTsPerClass = classes.map(function(c, i) {
+    return c.points.map(function(p) { return softmax(fc.logitsFn(p).map(function(l){return l/fc.bestT;}))[i]; }).sort(function(a,b){return a-b});
+  });
+  var fcCosScores = classes.map(function(c, ci) {
+    return c.points.map(function(p) { return v3dot(p, fc.wDirs[ci]); }).sort(function(a,b){return a-b});
+  });
+  var fcVmScores = classes.map(function(c, ci) {
+    return c.points.map(function(p) { return fc.fcKappas[ci] * v3dot(p, fc.wDirs[ci]); }).sort(function(a,b){return a-b});
+  });
+  var fcKentScores = classes.map(function(c, ci) {
+    return c.points.map(function(p) { return fc.fcKents[ci].kentScore(p); }).sort(function(a,b){return a-b});
+  });
+  var fcOdinSorted = _currentFcOdinPerClass().map(function(xs) { return xs.slice().sort(function(a,b){return a-b}); });
+  var fcVimSorted = _currentFcVimScores().slice().sort(function(a,b){return a-b});
+  return { fcMspPerClass: fcMspPerClass, fcMlsScores: fcMlsScores, fcEboScores: fcEboScores,
+           fcTsPerClass: fcTsPerClass, fcCosScores: fcCosScores, fcVmScores: fcVmScores,
+           fcKentScores: fcKentScores, fcOdinSorted: fcOdinSorted, fcVimSorted: fcVimSorted };
+}
+var _sortedFC = _buildSortedFCScores();
+
 function allThresholds(q) {
-  const mspGamma = trainMsp.map(xs => quantile(xs, q)).reduce((a,b) => a+b, 0) / classes.length;
-  const mlsThr = quantile(trainMLSscores, q);
-  const eboThr = quantile(trainEBOscores, q);
-  const perTSMSP = trainTSMSP.map(xs => quantile(xs, q));
-  const tsGam = perTSMSP.reduce((a,b) => a+b, 0) / classes.length;
-  const cosPC = classes.map(c => quantile(c.cosScores, q));
-  const vmBds = classes.map(c => [q, Math.max(q, 0.20), Math.max(q, 0.50)].map(bq => quantile(c.vmScores, bq)));
-  const kentBds = classes.map(c => [q, Math.max(q, 0.20), Math.max(q, 0.50)].map(bq => quantile(c.kentScores, bq)));
-  const mpcThr = quantile(trainMahalPC, 1 - q);
-  const msThr = quantile(trainMahalS, 1 - q);
-  const kThr = quantile(trainKNNdists, 1 - q);
-  const rThr = quantile(trainRMDS, 1 - q);
-  // FC thresholds
-  const fcMspGam = classes.map((c, i) => quantile(c.points.map(p => softmax(fc.logitsFn(p))[i]), q)).reduce((a,b) => a+b, 0) / nClasses;
-  const fcMlsThr2 = quantile(fcTrainX.map(p => Math.max(...fc.logitsFn(p))), q);
-  const fcEboThr2 = quantile(fcTrainX.map(p => logsumexp(fc.logitsFn(p))), q);
-  const fcTsGam = classes.map((c, i) => quantile(c.points.map(p => softmax(fc.logitsFn(p).map(l => l / fc.bestT))[i]), q)).reduce((a,b) => a+b, 0) / nClasses;
-  const fcCosPC = classes.map((c, ci) => quantile(c.points.map(p => v3dot(p, fc.wDirs[ci])), q));
-  const fcVmBds = classes.map((c, ci) => {
-    const scores = c.points.map(p => fc.fcKappas[ci] * v3dot(p, fc.wDirs[ci]));
-    return [q, Math.max(q, 0.20), Math.max(q, 0.50)].map(bq => quantile(scores, bq));
+  var mspGamma = _sortedTrainMsp.map(function(xs) { return quantileSorted(xs, q); }).reduce(function(a,b){return a+b}, 0) / classes.length;
+  var mlsThr = quantileSorted(_sortedMLSscores, q);
+  var eboThr = quantileSorted(_sortedEBOscores, q);
+  var perTSMSP = _sortedTSMSP.map(function(xs) { return quantileSorted(xs, q); });
+  var tsGam = perTSMSP.reduce(function(a,b){return a+b}, 0) / classes.length;
+  var cosPC = _sortedCosScores.map(function(xs) { return quantileSorted(xs, q); });
+  var vmBds = _sortedVmScores.map(function(xs) {
+    return [q, Math.max(q, 0.20), Math.max(q, 0.50)].map(function(bq) { return quantileSorted(xs, bq); });
   });
-  const fcKentBds = classes.map((c, ci) => {
-    const scores = c.points.map(p => fc.fcKents[ci].kentScore(p));
-    return [q, Math.max(q, 0.20), Math.max(q, 0.50)].map(bq => quantile(scores, bq));
+  var kentBds = _sortedKentScores.map(function(xs) {
+    return [q, Math.max(q, 0.20), Math.max(q, 0.50)].map(function(bq) { return quantileSorted(xs, bq); });
   });
-  // ODIN thresholds (from stored training score arrays)
-  const odinGam = _storedOdinPerClass.map(xs => quantile(xs, q)).reduce((a,b) => a+b, 0) / classes.length;
-  const fcOdinGam = _currentFcOdinPerClass().map(xs => quantile(xs, q)).reduce((a,b) => a+b, 0) / classes.length;
-  // ViM thresholds (from stored training score arrays)
-  const vimThr = quantile(_storedTrainVimScores, q);
-  const fcVimThr = quantile(_currentFcVimScores(), q);
-  // KDE threshold (higher density = more in-distribution, so use q directly, not 1-q)
-  const kdeThr = quantile(trainKDEscores, q);
-  return { mspGamma: mspGamma, mlsThr, eboThr, tsGamma: tsGam, cosPerClass: cosPC,
+  var mpcThr = quantileSorted(_sortedMahalPC, 1 - q);
+  var msThr = quantileSorted(_sortedMahalS, 1 - q);
+  var kThr = quantileSorted(_sortedKNNdists, 1 - q);
+  var rThr = quantileSorted(_sortedRMDS, 1 - q);
+  var kdeThr = quantileSorted(_sortedKDEscores, q);
+  // FC thresholds (from pre-sorted arrays)
+  var sf = _sortedFC;
+  var fcMspGam = sf.fcMspPerClass.map(function(xs) { return quantileSorted(xs, q); }).reduce(function(a,b){return a+b}, 0) / nClasses;
+  var fcMlsThr2 = quantileSorted(sf.fcMlsScores, q);
+  var fcEboThr2 = quantileSorted(sf.fcEboScores, q);
+  var fcTsGam = sf.fcTsPerClass.map(function(xs) { return quantileSorted(xs, q); }).reduce(function(a,b){return a+b}, 0) / nClasses;
+  var fcCosPC = sf.fcCosScores.map(function(xs) { return quantileSorted(xs, q); });
+  var fcVmBds = sf.fcVmScores.map(function(xs) {
+    return [q, Math.max(q, 0.20), Math.max(q, 0.50)].map(function(bq) { return quantileSorted(xs, bq); });
+  });
+  var fcKentBds = sf.fcKentScores.map(function(xs) {
+    return [q, Math.max(q, 0.20), Math.max(q, 0.50)].map(function(bq) { return quantileSorted(xs, bq); });
+  });
+  var odinGam = _sortedOdinPerClass.map(function(xs) { return quantileSorted(xs, q); }).reduce(function(a,b){return a+b}, 0) / classes.length;
+  var fcOdinGam = sf.fcOdinSorted.map(function(xs) { return quantileSorted(xs, q); }).reduce(function(a,b){return a+b}, 0) / classes.length;
+  var vimThr = quantileSorted(_sortedVimScores, q);
+  var fcVimThr = quantileSorted(sf.fcVimSorted, q);
+  return { mspGamma: mspGamma, mlsThr: mlsThr, eboThr: eboThr, tsGamma: tsGam, cosPerClass: cosPC,
            vmfBands: vmBds, kentBands: kentBds, mahalPCThr: mpcThr, mahalSThr: msThr,
-           knnThr: kThr, rmdsThr: rThr, kdeThr,
-           odinGamma: odinGam, fcOdinGamma: fcOdinGam, vimThr, fcVimThr,
+           knnThr: kThr, rmdsThr: rThr, kdeThr: kdeThr,
+           odinGamma: odinGam, fcOdinGamma: fcOdinGam, vimThr: vimThr, fcVimThr: fcVimThr,
            fcMspGamma: fcMspGam, fcMlsThr: fcMlsThr2, fcEboThr: fcEboThr2, fcTsGamma: fcTsGam,
            fcCosPerClass: fcCosPC, fcVmfBands: fcVmBds, fcKentBands: fcKentBds };
 }
@@ -2303,232 +2120,6 @@ if (PRE) {
   cachedThr = allThresholds(Q);
 }
 
-// ── computeTexPixels and getMethodEvalFn (Feature 3) ──
-function computeTexPixels(evalFn, w, h) {
-  const buf = new Uint8Array(w * h * 4);
-  for (let py = 0; py < h; py++) {
-    for (let px2 = 0; px2 < w; px2++) {
-      const dir = dirFromUV(px2 / w, py / h);
-      const result = evalFn(dir);
-      if (result) {
-        const idx = (py * w + px2) * 4;
-        const [r, g, b] = hexToRGB(result.color);
-        buf[idx] = r; buf[idx+1] = g; buf[idx+2] = b;
-        buf[idx+3] = Math.round((result.opacity || 0.55) * 255);
-      }
-    }
-  }
-  return buf.buffer;
-}
-
-// Async version: computes ROWS_PER_CHUNK rows per frame, yielding to
-// requestAnimationFrame between chunks so the sphere animation stays smooth.
-function computeTexPixelsAsync(evalFn, w, h, onDone) {
-  const buf = new Uint8Array(w * h * 4);
-  let py = 0;
-  const ROWS = 8;
-  function chunk() {
-    const end = Math.min(py + ROWS, h);
-    for (; py < end; py++) {
-      for (let px2 = 0; px2 < w; px2++) {
-        const dir = dirFromUV(px2 / w, py / h);
-        const result = evalFn(dir);
-        if (result) {
-          const idx = (py * w + px2) * 4;
-          const [r, g, b] = hexToRGB(result.color);
-          buf[idx] = r; buf[idx+1] = g; buf[idx+2] = b;
-          buf[idx+3] = Math.round((result.opacity || 0.55) * 255);
-        }
-      }
-    }
-    if (py < h) requestAnimationFrame(chunk);
-    else onDone(buf.buffer);
-  }
-  requestAnimationFrame(chunk);
-}
-
-function getMethodEvalFn(method, thr) {
-  const bandOpacities = [0.18, 0.35, 0.55];
-  switch (method) {
-    case "msp": return (p) => {
-      const logits2 = W.map(w => TAU * v3dot(p, w));
-      const probs2 = softmax(logits2);
-      let a = 0; for (let i = 1; i < probs2.length; i++) if (probs2[i] > probs2[a]) a = i;
-      return probs2[a] >= thr.mspGamma ? { color: classes[a].color, opacity: 0.55 } : null;
-    };
-    case "mls": return (p) => {
-      const logits2 = W.map(w => TAU * v3dot(p, w));
-      const mx = Math.max(...logits2);
-      if (mx >= thr.mlsThr) { let a = 0; for (let i = 1; i < logits2.length; i++) if (logits2[i] > logits2[a]) a = i;
-        return { color: classes[a].color, opacity: 0.55 }; } return null;
-    };
-    case "ebo": return (p) => {
-      const logits2 = W.map(w => TAU * v3dot(p, w));
-      if (logsumexp(logits2) >= thr.eboThr) { let a = 0; for (let i = 1; i < logits2.length; i++) if (logits2[i] > logits2[a]) a = i;
-        return { color: classes[a].color, opacity: 0.55 }; } return null;
-    };
-    case "ts": return (p) => {
-      const logits2 = W.map(w => (TAU / bestT) * v3dot(p, w));
-      const probs2 = softmax(logits2);
-      let a = 0; for (let i = 1; i < probs2.length; i++) if (probs2[i] > probs2[a]) a = i;
-      return probs2[a] >= thr.tsGamma ? { color: classes[a].color, opacity: 0.55 } : null;
-    };
-    case "odin": return (p) => {
-      const r = odinScore(p, protoGetLogits, protoOdinWeights, odinT, odinEps);
-      return r.score >= thr.odinGamma ? { color: classes[r.argmax].color, opacity: 0.55 } : null;
-    };
-    case "vim": return (p) => {
-      const r = vimScoreFn(p, protoGetLogits);
-      if (r.energy >= thr.vimThr) {
-        return { color: classes[r.argmax].color, opacity: 0.55 };
-      }
-      return null;
-    };
-    case "cos": return (p) => {
-      let best2 = null, bestR2 = -Infinity;
-      for (let ci = 0; ci < classes.length; ci++) {
-        const s = v3dot(p, classes[ci].muHat);
-        const ratio = thr.cosPerClass[ci] !== 0 ? s / thr.cosPerClass[ci] : s;
-        if (s >= thr.cosPerClass[ci] && ratio > bestR2) { best2 = classes[ci]; bestR2 = ratio; }
-      }
-      return best2 ? { color: best2.color, opacity: 0.55 } : null;
-    };
-    case "vmf": return (p) => {
-      let best2 = -1, bestRatio2 = -Infinity, bestS2 = 0;
-      for (let ci = 0; ci < classes.length; ci++) {
-        const s = classes[ci].kappa * v3dot(p, classes[ci].muHat);
-        const thrVal = thr.vmfBands[ci][0];
-        if (s >= thrVal) {
-          const ratio = thrVal !== 0 ? s / thrVal : s;
-          if (ratio > bestRatio2) { best2 = ci; bestRatio2 = ratio; bestS2 = s; }
-        }
-      }
-      if (best2 < 0) return null;
-      const maxS = Math.max(...classes[best2].vmScores);
-      const thrVal = thr.vmfBands[best2][0];
-      const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
-      return { color: classes[best2].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
-    };
-    case "kent": return (p) => {
-      let best2 = -1, bestRatio2 = -Infinity, bestS2 = 0;
-      for (let ci = 0; ci < classes.length; ci++) {
-        const s = classes[ci].kent.kentScore(p);
-        const thrVal = thr.kentBands[ci][0];
-        if (s >= thrVal) {
-          const ratio = thrVal !== 0 ? s / thrVal : s;
-          if (ratio > bestRatio2) { best2 = ci; bestRatio2 = ratio; bestS2 = s; }
-        }
-      }
-      if (best2 < 0) return null;
-      const maxS = Math.max(...classes[best2].kentScores);
-      const thrVal = thr.kentBands[best2][0];
-      const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
-      return { color: classes[best2].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
-    };
-    case "knn": return (p) => {
-      const r = knnResult(p);
-      if (r.kthDist <= thr.knnThr) return { color: classes[r.nearestLabel].color, opacity: 0.55 };
-      return null;
-    };
-    case "rmds": return (p) => {
-      const r = rmdsScore(p);
-      if (r.score <= thr.rmdsThr) return { color: classes[r.bestClass].color, opacity: 0.55 };
-      return null;
-    };
-    case "kde": return (p) => {
-      const r = kdeScore(p);
-      if (r.density >= thr.kdeThr) {
-        const maxD = Math.max(...trainKDEscores);
-        const t = maxD > thr.kdeThr ? (r.density - thr.kdeThr) / (maxD - thr.kdeThr) : 1;
-        return { color: classes[r.bestClass].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
-      }
-      return null;
-    };
-    case "fc-msp": return (p) => {
-      const l = fc.logitsFn(p), pr = softmax(l); let a = 0;
-      for (let i = 1; i < pr.length; i++) if (pr[i] > pr[a]) a = i;
-      return pr[a] >= thr.fcMspGamma ? { color: classes[a].color, opacity: 0.55 } : null;
-    };
-    case "fc-mls": return (p) => {
-      const l = fc.logitsFn(p), mx = Math.max(...l);
-      if (mx >= thr.fcMlsThr) { let a = 0; for (let i = 1; i < l.length; i++) if (l[i] > l[a]) a = i;
-        return { color: classes[a].color, opacity: 0.55 }; } return null;
-    };
-    case "fc-ebo": return (p) => {
-      const l = fc.logitsFn(p);
-      if (logsumexp(l) >= thr.fcEboThr) { let a = 0; for (let i = 1; i < l.length; i++) if (l[i] > l[a]) a = i;
-        return { color: classes[a].color, opacity: 0.55 }; } return null;
-    };
-    case "fc-ts": return (p) => {
-      const l = fc.logitsFn(p), pr = softmax(l.map(v => v / fc.bestT)); let a = 0;
-      for (let i = 1; i < pr.length; i++) if (pr[i] > pr[a]) a = i;
-      return pr[a] >= thr.fcTsGamma ? { color: classes[a].color, opacity: 0.55 } : null;
-    };
-    case "fc-odin": return (p) => {
-      const r = odinScore(p, fc.logitsFn, fc.W, odinT, odinEps);
-      return r.score >= thr.fcOdinGamma ? { color: classes[r.argmax].color, opacity: 0.55 } : null;
-    };
-    case "fc-vim": return (p) => {
-      const r = fcVimScoreFn(p);
-      if (r.energy >= thr.fcVimThr) {
-        return { color: classes[r.argmax].color, opacity: 0.55 };
-      }
-      return null;
-    };
-    case "fc-cos": return (p) => {
-      let best2 = null, bestR2 = -Infinity;
-      for (let ci = 0; ci < classes.length; ci++) {
-        const s = v3dot(p, fc.wDirs[ci]);
-        const ratio = thr.fcCosPerClass[ci] !== 0 ? s / thr.fcCosPerClass[ci] : s;
-        if (s >= thr.fcCosPerClass[ci] && ratio > bestR2) { best2 = classes[ci]; bestR2 = ratio; }
-      }
-      return best2 ? { color: best2.color, opacity: 0.55 } : null;
-    };
-    case "fc-vmf": return (p) => {
-      let best2 = -1, bestRatio2 = -Infinity, bestS2 = 0;
-      for (let ci = 0; ci < classes.length; ci++) {
-        const s = fc.fcKappas[ci] * v3dot(p, fc.wDirs[ci]);
-        const thrVal = thr.fcVmfBands[ci][0];
-        if (s >= thrVal) {
-          const ratio = thrVal !== 0 ? s / thrVal : s;
-          if (ratio > bestRatio2) { best2 = ci; bestRatio2 = ratio; bestS2 = s; }
-        }
-      }
-      if (best2 < 0) return null;
-      const fcVmScores = classes[best2].points.map(pt => fc.fcKappas[best2] * v3dot(pt, fc.wDirs[best2]));
-      const maxS = Math.max(...fcVmScores);
-      const thrVal = thr.fcVmfBands[best2][0];
-      const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
-      return { color: classes[best2].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
-    };
-    case "fc-kent": return (p) => {
-      let best2 = -1, bestRatio2 = -Infinity, bestS2 = 0;
-      for (let ci = 0; ci < classes.length; ci++) {
-        const s = fc.fcKents[ci].kentScore(p);
-        const thrVal = thr.fcKentBands[ci][0];
-        if (s >= thrVal) {
-          const ratio = thrVal !== 0 ? s / thrVal : s;
-          if (ratio > bestRatio2) { best2 = ci; bestRatio2 = ratio; bestS2 = s; }
-        }
-      }
-      if (best2 < 0) return null;
-      const fcKScores = classes[best2].points.map(pt => fc.fcKents[best2].kentScore(pt));
-      const maxS = Math.max(...fcKScores);
-      const thrVal = thr.fcKentBands[best2][0];
-      const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
-      return { color: classes[best2].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
-    };
-    default: return null;
-  }
-}
-
-// ── Texture cache and rendering at non-default q (Feature 3) ──
-const methodTexCache = new Map();
-
-function methodCacheKey(method, q) {
-  return method + "-" + q.toFixed(2) + (fcModes2.has(method) ? "-" + fcBalanced : "");
-}
-
 var _qHeaderLabel = null;
 function qShowSpinner() {
   if (!_qHeaderLabel) _qHeaderLabel = document.getElementById("q-header-label");
@@ -2539,33 +2130,1365 @@ function qHideSpinner() {
   if (_qHeaderLabel) _qHeaderLabel.textContent = "q";
 }
 
+// ══════════════════════════════════════════════
+//  GPU SHADER-BASED THRESHOLD RENDERING
+// ══════════════════════════════════════════════
+// Instead of rebuilding a 2048x1024 RGBA texture on the CPU every time q
+// changes, precompute the score field once per method, upload as DataTextures,
+// and let a fragment shader threshold them.  When q changes we only update a
+// uniform -- the GPU re-renders at 60 fps.
+
+// -- Method classification -------------------------------------------------
+// Type A (single threshold): MSP, MLS, EBO, TS, ODIN, ViM, KNN, RMDS, KDE
+// Type B (per-class threshold + ratio overlap): Cos, vMF, Kent, fc-cos, fc-vmf, fc-kent
+var _shaderTypeB = new Set(["cos","vmf","kent","fc-cos","fc-vmf","fc-kent"]);
+// Gradient methods (opacity varies with score)
+var _shaderGradient = new Set(["vmf","kent","kde","fc-vmf","fc-kent"]);
+
+// -- Shared vertex shader --------------------------------------------------
+var _shaderVert = [
+  "varying vec2 vUv;",
+  "void main() {",
+  "  vUv = uv;",
+  "  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);",
+  "}"
+].join("\n");
+
+// Shared sphere geometry for all shader overlays (avoids GPU geometry leaks)
+var _sharedOverlayGeo = new THREE.SphereGeometry(1.005, 128, 64);
+
+// ══════════════════════════════════════════════
+//  PROCEDURAL GPU FRAGMENT SHADERS
+// ══════════════════════════════════════════════
+// These shaders compute OOD scores directly from the sphere direction in the
+// fragment shader — no CPU precompute, no DataTextures.  Threshold/parameter
+// uniforms are updated instantly when q or alpha changes.
+
+// -- Shared GLSL preamble (dirFromUV, inserted into every procedural shader) --
+var _glslDirFromUV = [
+  "vec3 dirFromUV(vec2 uv) {",
+  "  float phi = uv.x * 6.28318530718;",
+  "  float theta = (1.0 - uv.y) * 3.14159265359;",
+  "  float sinT = sin(theta);",
+  "  return vec3(-sinT * cos(phi), cos(theta), sinT * sin(phi));",
+  "}"
+].join("\n");
+
+// -- Shared GLSL color selection (no dynamic indexing in GLSL ES 1.0) --------
+var _glslPickColor = [
+  "  vec3 color = classColors[0];",
+  "  if (bestCI == 1) color = classColors[1];",
+  "  else if (bestCI == 2) color = classColors[2];",
+  "  else if (bestCI == 3) color = classColors[3];",
+  "  else if (bestCI == 4) color = classColors[4];"
+].join("\n");
+
+// -- 1. Logit-based: MSP / MLS / EBO / TS (+ FC variants) --------------------
+// scoreMode: 0 = softmax-max (MSP/TS), 1 = max-logit (MLS), 2 = logsumexp (EBO)
+var _shaderFragLogit = [
+  "precision highp float;",
+  "uniform vec3 classW[5];",
+  "uniform float classB[5];",
+  "uniform float threshold;",
+  "uniform vec3 classColors[5];",
+  "uniform int scoreMode;",
+  "varying vec2 vUv;",
+  _glslDirFromUV,
+  "void main() {",
+  "  vec3 x = dirFromUV(vUv);",
+  "  float l0 = dot(classW[0], x) + classB[0];",
+  "  float l1 = dot(classW[1], x) + classB[1];",
+  "  float l2 = dot(classW[2], x) + classB[2];",
+  "  float l3 = dot(classW[3], x) + classB[3];",
+  "  float l4 = dot(classW[4], x) + classB[4];",
+  // Find max logit and argmax
+  "  float maxL = l0; int bestCI = 0;",
+  "  if (l1 > maxL) { maxL = l1; bestCI = 1; }",
+  "  if (l2 > maxL) { maxL = l2; bestCI = 2; }",
+  "  if (l3 > maxL) { maxL = l3; bestCI = 3; }",
+  "  if (l4 > maxL) { maxL = l4; bestCI = 4; }",
+  "  float score = 0.0;",
+  "  if (scoreMode == 1) {",
+  // MLS: score = max logit
+  "    score = maxL;",
+  "  } else if (scoreMode == 2) {",
+  // EBO: score = logsumexp
+  "    score = maxL + log(exp(l0 - maxL) + exp(l1 - maxL) + exp(l2 - maxL) + exp(l3 - maxL) + exp(l4 - maxL));",
+  "  } else {",
+  // MSP / TS: score = max softmax prob
+  "    float e0 = exp(l0 - maxL); float e1 = exp(l1 - maxL); float e2 = exp(l2 - maxL);",
+  "    float e3 = exp(l3 - maxL); float e4 = exp(l4 - maxL);",
+  "    float sumE = e0 + e1 + e2 + e3 + e4;",
+  "    float maxP = e0;",
+  "    if (e1 > maxP) maxP = e1;",
+  "    if (e2 > maxP) maxP = e2;",
+  "    if (e3 > maxP) maxP = e3;",
+  "    if (e4 > maxP) maxP = e4;",
+  "    score = maxP / sumE;",
+  "  }",
+  "  if (score >= threshold) {",
+  _glslPickColor,
+  "    gl_FragColor = vec4(color, 0.55);",
+  "  } else {",
+  "    gl_FragColor = vec4(0.0);",
+  "  }",
+  "}"
+].join("\n");
+
+// -- 2. Cos / vMF (+ FC variants) — per-class thresholds, ratio overlap ------
+var _shaderFragCosVMF = [
+  "precision highp float;",
+  "uniform vec3 classDir[5];",
+  "uniform float classKappa[5];",
+  "uniform float perClassThr[5];",
+  "uniform vec3 classColors[5];",
+  "uniform float isGradient;",
+  "uniform float maxTrainScores[5];",
+  "varying vec2 vUv;",
+  _glslDirFromUV,
+  "void main() {",
+  "  vec3 x = dirFromUV(vUv);",
+  // Compute per-class scores (unrolled)
+  "  float s0 = classKappa[0] * dot(classDir[0], x);",
+  "  float s1 = classKappa[1] * dot(classDir[1], x);",
+  "  float s2 = classKappa[2] * dot(classDir[2], x);",
+  "  float s3 = classKappa[3] * dot(classDir[3], x);",
+  "  float s4 = classKappa[4] * dot(classDir[4], x);",
+  // Ratio-based overlap resolution (unrolled)
+  "  int bestCI = -1;",
+  "  float bestRatio = -100000.0;",
+  "  float bestScore = 0.0;",
+  "  if (s0 >= perClassThr[0]) { float r = s0 / max(perClassThr[0], 0.0000001); if (r > bestRatio) { bestCI = 0; bestRatio = r; bestScore = s0; } }",
+  "  if (s1 >= perClassThr[1]) { float r = s1 / max(perClassThr[1], 0.0000001); if (r > bestRatio) { bestCI = 1; bestRatio = r; bestScore = s1; } }",
+  "  if (s2 >= perClassThr[2]) { float r = s2 / max(perClassThr[2], 0.0000001); if (r > bestRatio) { bestCI = 2; bestRatio = r; bestScore = s2; } }",
+  "  if (s3 >= perClassThr[3]) { float r = s3 / max(perClassThr[3], 0.0000001); if (r > bestRatio) { bestCI = 3; bestRatio = r; bestScore = s3; } }",
+  "  if (s4 >= perClassThr[4]) { float r = s4 / max(perClassThr[4], 0.0000001); if (r > bestRatio) { bestCI = 4; bestRatio = r; bestScore = s4; } }",
+  "  if (bestCI >= 0) {",
+  _glslPickColor,
+  "    float alpha = 0.55;",
+  "    if (isGradient > 0.5) {",
+  "      float thr = perClassThr[0]; float mts = maxTrainScores[0];",
+  "      if (bestCI == 1) { thr = perClassThr[1]; mts = maxTrainScores[1]; }",
+  "      else if (bestCI == 2) { thr = perClassThr[2]; mts = maxTrainScores[2]; }",
+  "      else if (bestCI == 3) { thr = perClassThr[3]; mts = maxTrainScores[3]; }",
+  "      else if (bestCI == 4) { thr = perClassThr[4]; mts = maxTrainScores[4]; }",
+  "      float t = (mts > thr + 0.0001) ? (bestScore - thr) / (mts - thr) : 1.0;",
+  "      alpha = 0.01 + 0.74 * clamp(t, 0.0, 1.0);",
+  "    }",
+  "    gl_FragColor = vec4(color, alpha);",
+  "  } else {",
+  "    gl_FragColor = vec4(0.0);",
+  "  }",
+  "}"
+].join("\n");
+
+// -- 3. Kent (+ FC variant) — separate shader for uniform budget -------------
+var _shaderFragKent = [
+  "precision highp float;",
+  "uniform vec3 kentGamma1[5];",
+  "uniform vec3 kentGamma2[5];",
+  "uniform float kentKappa[5];",
+  "uniform float kentBeta[5];",
+  "uniform float perClassThr[5];",
+  "uniform vec3 classColors[5];",
+  "uniform float isGradient;",
+  "uniform float maxTrainScores[5];",
+  "varying vec2 vUv;",
+  _glslDirFromUV,
+  "void main() {",
+  "  vec3 x = dirFromUV(vUv);",
+  // Compute Kent scores: kappa*(gamma1·x) + beta*[(gamma2·x)² - (gamma3·x)²]
+  // gamma3 = cross(gamma1, gamma2) — derived in shader to save uniform slots
+  "  float s0, s1, s2, s3, s4;",
+  "  {",
+  "    float d1 = dot(kentGamma1[0], x); float d2 = dot(kentGamma2[0], x);",
+  "    vec3 g3 = cross(kentGamma1[0], kentGamma2[0]); float d3 = dot(g3, x);",
+  "    s0 = kentKappa[0] * d1 + kentBeta[0] * (d2*d2 - d3*d3);",
+  "  }",
+  "  {",
+  "    float d1 = dot(kentGamma1[1], x); float d2 = dot(kentGamma2[1], x);",
+  "    vec3 g3 = cross(kentGamma1[1], kentGamma2[1]); float d3 = dot(g3, x);",
+  "    s1 = kentKappa[1] * d1 + kentBeta[1] * (d2*d2 - d3*d3);",
+  "  }",
+  "  {",
+  "    float d1 = dot(kentGamma1[2], x); float d2 = dot(kentGamma2[2], x);",
+  "    vec3 g3 = cross(kentGamma1[2], kentGamma2[2]); float d3 = dot(g3, x);",
+  "    s2 = kentKappa[2] * d1 + kentBeta[2] * (d2*d2 - d3*d3);",
+  "  }",
+  "  {",
+  "    float d1 = dot(kentGamma1[3], x); float d2 = dot(kentGamma2[3], x);",
+  "    vec3 g3 = cross(kentGamma1[3], kentGamma2[3]); float d3 = dot(g3, x);",
+  "    s3 = kentKappa[3] * d1 + kentBeta[3] * (d2*d2 - d3*d3);",
+  "  }",
+  "  {",
+  "    float d1 = dot(kentGamma1[4], x); float d2 = dot(kentGamma2[4], x);",
+  "    vec3 g3 = cross(kentGamma1[4], kentGamma2[4]); float d3 = dot(g3, x);",
+  "    s4 = kentKappa[4] * d1 + kentBeta[4] * (d2*d2 - d3*d3);",
+  "  }",
+  // Ratio-based overlap resolution
+  "  int bestCI = -1;",
+  "  float bestRatio = -100000.0;",
+  "  float bestScore = 0.0;",
+  "  if (s0 >= perClassThr[0]) { float r = s0 / max(perClassThr[0], 0.0000001); if (r > bestRatio) { bestCI = 0; bestRatio = r; bestScore = s0; } }",
+  "  if (s1 >= perClassThr[1]) { float r = s1 / max(perClassThr[1], 0.0000001); if (r > bestRatio) { bestCI = 1; bestRatio = r; bestScore = s1; } }",
+  "  if (s2 >= perClassThr[2]) { float r = s2 / max(perClassThr[2], 0.0000001); if (r > bestRatio) { bestCI = 2; bestRatio = r; bestScore = s2; } }",
+  "  if (s3 >= perClassThr[3]) { float r = s3 / max(perClassThr[3], 0.0000001); if (r > bestRatio) { bestCI = 3; bestRatio = r; bestScore = s3; } }",
+  "  if (s4 >= perClassThr[4]) { float r = s4 / max(perClassThr[4], 0.0000001); if (r > bestRatio) { bestCI = 4; bestRatio = r; bestScore = s4; } }",
+  "  if (bestCI >= 0) {",
+  _glslPickColor,
+  "    float alpha = 0.55;",
+  "    if (isGradient > 0.5) {",
+  "      float thr = perClassThr[0]; float mts = maxTrainScores[0];",
+  "      if (bestCI == 1) { thr = perClassThr[1]; mts = maxTrainScores[1]; }",
+  "      else if (bestCI == 2) { thr = perClassThr[2]; mts = maxTrainScores[2]; }",
+  "      else if (bestCI == 3) { thr = perClassThr[3]; mts = maxTrainScores[3]; }",
+  "      else if (bestCI == 4) { thr = perClassThr[4]; mts = maxTrainScores[4]; }",
+  "      float t = (mts > thr + 0.0001) ? (bestScore - thr) / (mts - thr) : 1.0;",
+  "      alpha = 0.01 + 0.74 * clamp(t, 0.0, 1.0);",
+  "    }",
+  "    gl_FragColor = vec4(color, alpha);",
+  "  } else {",
+  "    gl_FragColor = vec4(0.0);",
+  "  }",
+  "}"
+].join("\n");
+
+// -- 4. ODIN (proto + FC) — two logit evaluations in one fragment -------------
+var _shaderFragODIN = [
+  "precision highp float;",
+  "uniform vec3 classW[5];",
+  "uniform float classB[5];",
+  "uniform float odinT;",
+  "uniform float odinEps;",
+  "uniform float threshold;",
+  "uniform vec3 classColors[5];",
+  "varying vec2 vUv;",
+  _glslDirFromUV,
+  "void main() {",
+  "  vec3 x = dirFromUV(vUv);",
+  // Step 1: logits and softmax(logits/T)
+  "  float l0 = dot(classW[0], x) + classB[0];",
+  "  float l1 = dot(classW[1], x) + classB[1];",
+  "  float l2 = dot(classW[2], x) + classB[2];",
+  "  float l3 = dot(classW[3], x) + classB[3];",
+  "  float l4 = dot(classW[4], x) + classB[4];",
+  "  float t0 = l0 / odinT; float t1 = l1 / odinT; float t2 = l2 / odinT;",
+  "  float t3 = l3 / odinT; float t4 = l4 / odinT;",
+  "  float maxT = t0;",
+  "  if (t1 > maxT) maxT = t1; if (t2 > maxT) maxT = t2;",
+  "  if (t3 > maxT) maxT = t3; if (t4 > maxT) maxT = t4;",
+  "  float e0 = exp(t0 - maxT); float e1 = exp(t1 - maxT);",
+  "  float e2 = exp(t2 - maxT); float e3 = exp(t3 - maxT); float e4 = exp(t4 - maxT);",
+  "  float sumE = e0 + e1 + e2 + e3 + e4;",
+  "  float p0 = e0/sumE; float p1 = e1/sumE; float p2 = e2/sumE;",
+  "  float p3 = e3/sumE; float p4 = e4/sumE;",
+  // Find yhat (argmax of probs)
+  "  int yhat = 0; float maxP = p0;",
+  "  if (p1 > maxP) { maxP = p1; yhat = 1; }",
+  "  if (p2 > maxP) { maxP = p2; yhat = 2; }",
+  "  if (p3 > maxP) { maxP = p3; yhat = 3; }",
+  "  if (p4 > maxP) { maxP = p4; yhat = 4; }",
+  // Step 2: gradient = (1/T) * (W[yhat] - sum_i p_i * W[i])
+  "  vec3 wYhat = classW[0];",
+  "  if (yhat == 1) wYhat = classW[1];",
+  "  else if (yhat == 2) wYhat = classW[2];",
+  "  else if (yhat == 3) wYhat = classW[3];",
+  "  else if (yhat == 4) wYhat = classW[4];",
+  "  vec3 wAvg = p0*classW[0] + p1*classW[1] + p2*classW[2] + p3*classW[3] + p4*classW[4];",
+  "  vec3 grad = (wYhat - wAvg) / odinT;",
+  // Step 3: perturb x' = normalize(x + eps * sign(grad))
+  // sign: >= 0 → 1, < 0 → -1 (matching JS behavior, not GLSL sign which returns 0 for 0)
+  "  vec3 sg = vec3(",
+  "    grad.x >= 0.0 ? 1.0 : -1.0,",
+  "    grad.y >= 0.0 ? 1.0 : -1.0,",
+  "    grad.z >= 0.0 ? 1.0 : -1.0);",
+  "  vec3 xp = normalize(x + odinEps * sg);",
+  // Step 4: logits at x', softmax, max prob = score
+  "  float l0p = dot(classW[0], xp) + classB[0];",
+  "  float l1p = dot(classW[1], xp) + classB[1];",
+  "  float l2p = dot(classW[2], xp) + classB[2];",
+  "  float l3p = dot(classW[3], xp) + classB[3];",
+  "  float l4p = dot(classW[4], xp) + classB[4];",
+  "  float t0p = l0p/odinT; float t1p = l1p/odinT; float t2p = l2p/odinT;",
+  "  float t3p = l3p/odinT; float t4p = l4p/odinT;",
+  "  float maxTp = t0p;",
+  "  if (t1p > maxTp) maxTp = t1p; if (t2p > maxTp) maxTp = t2p;",
+  "  if (t3p > maxTp) maxTp = t3p; if (t4p > maxTp) maxTp = t4p;",
+  "  float e0p = exp(t0p - maxTp); float e1p = exp(t1p - maxTp);",
+  "  float e2p = exp(t2p - maxTp); float e3p = exp(t3p - maxTp); float e4p = exp(t4p - maxTp);",
+  "  float sumEp = e0p + e1p + e2p + e3p + e4p;",
+  "  float score = max(max(max(max(e0p, e1p), e2p), e3p), e4p) / sumEp;",
+  // Find argmax for color
+  "  int bestCI = 0; float bestE = e0p;",
+  "  if (e1p > bestE) { bestE = e1p; bestCI = 1; }",
+  "  if (e2p > bestE) { bestE = e2p; bestCI = 2; }",
+  "  if (e3p > bestE) { bestE = e3p; bestCI = 3; }",
+  "  if (e4p > bestE) { bestE = e4p; bestCI = 4; }",
+  "  if (score >= threshold) {",
+  _glslPickColor,
+  "    gl_FragColor = vec4(color, 0.55);",
+  "  } else {",
+  "    gl_FragColor = vec4(0.0);",
+  "  }",
+  "}"
+].join("\n");
+
+// -- 5. ViM (proto + FC) — logits + PCA residual → virtual logit → logsumexp -
+var _shaderFragViM = [
+  "precision highp float;",
+  "uniform vec3 classW[5];",
+  "uniform float classB[5];",
+  "uniform vec3 vimU0;",
+  "uniform vec3 vimU1;",
+  "uniform vec3 muAll;",
+  "uniform float vimAlphaU;",  // named vimAlphaU to avoid GLSL keyword clash
+  "uniform float threshold;",
+  "uniform vec3 classColors[5];",
+  "varying vec2 vUv;",
+  _glslDirFromUV,
+  "void main() {",
+  "  vec3 x = dirFromUV(vUv);",
+  // Compute logits
+  "  float l0 = dot(classW[0], x) + classB[0];",
+  "  float l1 = dot(classW[1], x) + classB[1];",
+  "  float l2 = dot(classW[2], x) + classB[2];",
+  "  float l3 = dot(classW[3], x) + classB[3];",
+  "  float l4 = dot(classW[4], x) + classB[4];",
+  // Compute residual: xc = x - muAll; proj = sum of (xc·u)*u for each principal component
+  "  vec3 xc = x - muAll;",
+  "  vec3 proj = dot(xc, vimU0) * vimU0 + dot(xc, vimU1) * vimU1;",
+  "  vec3 res = xc - proj;",
+  "  float vLogit = vimAlphaU * length(res);",
+  // logsumexp of 6 values (5 logits + virtual logit)
+  "  float maxL = l0;",
+  "  if (l1 > maxL) maxL = l1; if (l2 > maxL) maxL = l2;",
+  "  if (l3 > maxL) maxL = l3; if (l4 > maxL) maxL = l4;",
+  "  if (vLogit > maxL) maxL = vLogit;",
+  "  float score = maxL + log(exp(l0-maxL) + exp(l1-maxL) + exp(l2-maxL) + exp(l3-maxL) + exp(l4-maxL) + exp(vLogit-maxL));",
+  // bestCI = argmax of real logits (not virtual)
+  "  int bestCI = 0; float bestL = l0;",
+  "  if (l1 > bestL) { bestL = l1; bestCI = 1; }",
+  "  if (l2 > bestL) { bestL = l2; bestCI = 2; }",
+  "  if (l3 > bestL) { bestL = l3; bestCI = 3; }",
+  "  if (l4 > bestL) { bestL = l4; bestCI = 4; }",
+  "  if (score >= threshold) {",
+  _glslPickColor,
+  "    gl_FragColor = vec4(color, 0.55);",
+  "  } else {",
+  "    gl_FragColor = vec4(0.0);",
+  "  }",
+  "}"
+].join("\n");
+
+// -- 6. RMDS — 3x3 Mahalanobis, inverted threshold (score <= thr passes) -----
+var _shaderFragRMDS = [
+  "precision highp float;",
+  "uniform mat3 invCov;",
+  "uniform vec3 classMeans[5];",
+  "uniform vec3 globalMean;",
+  "uniform float threshold;",
+  "uniform vec3 classColors[5];",
+  "varying vec2 vUv;",
+  _glslDirFromUV,
+  "float mahalDist2(vec3 x, vec3 mu) {",
+  "  vec3 d = x - mu;",
+  "  return dot(d, invCov * d);",
+  "}",
+  "void main() {",
+  "  vec3 x = dirFromUV(vUv);",
+  // min_k mahalDist(x, classMeans[k]) - mahalDist(x, globalMean)
+  "  float d0 = mahalDist2(x, classMeans[0]);",
+  "  float d1 = mahalDist2(x, classMeans[1]);",
+  "  float d2 = mahalDist2(x, classMeans[2]);",
+  "  float d3 = mahalDist2(x, classMeans[3]);",
+  "  float d4 = mahalDist2(x, classMeans[4]);",
+  "  float minD = d0; int bestCI = 0;",
+  "  if (d1 < minD) { minD = d1; bestCI = 1; }",
+  "  if (d2 < minD) { minD = d2; bestCI = 2; }",
+  "  if (d3 < minD) { minD = d3; bestCI = 3; }",
+  "  if (d4 < minD) { minD = d4; bestCI = 4; }",
+  "  float bgDist = mahalDist2(x, globalMean);",
+  "  float score = minD - bgDist;",
+  // Inverted threshold: lower score = more in-distribution
+  "  if (score <= threshold) {",
+  _glslPickColor,
+  "    gl_FragColor = vec4(color, 0.55);",
+  "  } else {",
+  "    gl_FragColor = vec4(0.0);",
+  "  }",
+  "}"
+].join("\n");
+
+// -- 7. Conformal MSP / EMB — per-class inclusion scores ----------------------
+// scoreMode: 0 = MSP (softmax probs), 1 = EMB (cosine similarities)
+var _shaderFragConformalMSPEmb = [
+  "precision highp float;",
+  "uniform vec3 classW[5];",
+  "uniform float classB[5];",
+  "uniform vec3 classMuHat[5];",
+  "uniform float threshold;",  // = 1 - qhat
+  "uniform vec3 classColors[5];",
+  "uniform int scoreMode;",    // 0 = msp, 1 = emb
+  "varying vec2 vUv;",
+  _glslDirFromUV,
+  "void main() {",
+  "  vec3 x = dirFromUV(vUv);",
+  "  float sc0, sc1, sc2, sc3, sc4;",
+  "  if (scoreMode == 1) {",
+  // EMB: score[k] = cos(x, muHat[k])
+  "    sc0 = dot(x, classMuHat[0]);",
+  "    sc1 = dot(x, classMuHat[1]);",
+  "    sc2 = dot(x, classMuHat[2]);",
+  "    sc3 = dot(x, classMuHat[3]);",
+  "    sc4 = dot(x, classMuHat[4]);",
+  "  } else {",
+  // MSP: score[k] = softmax(logits)[k]
+  "    float l0 = dot(classW[0], x) + classB[0];",
+  "    float l1 = dot(classW[1], x) + classB[1];",
+  "    float l2 = dot(classW[2], x) + classB[2];",
+  "    float l3 = dot(classW[3], x) + classB[3];",
+  "    float l4 = dot(classW[4], x) + classB[4];",
+  "    float maxL = max(max(max(max(l0,l1),l2),l3),l4);",
+  "    float e0 = exp(l0 - maxL); float e1 = exp(l1 - maxL);",
+  "    float e2 = exp(l2 - maxL); float e3 = exp(l3 - maxL); float e4 = exp(l4 - maxL);",
+  "    float sumE = e0 + e1 + e2 + e3 + e4;",
+  "    sc0 = e0/sumE; sc1 = e1/sumE; sc2 = e2/sumE; sc3 = e3/sumE; sc4 = e4/sumE;",
+  "  }",
+  // Count and find best class in prediction set
+  "  int bestCI = -1; float bestScore = -1.0; int count = 0;",
+  "  if (sc0 >= threshold) { count++; if (sc0 > bestScore) { bestCI = 0; bestScore = sc0; } }",
+  "  if (sc1 >= threshold) { count++; if (sc1 > bestScore) { bestCI = 1; bestScore = sc1; } }",
+  "  if (sc2 >= threshold) { count++; if (sc2 > bestScore) { bestCI = 2; bestScore = sc2; } }",
+  "  if (sc3 >= threshold) { count++; if (sc3 > bestScore) { bestCI = 3; bestScore = sc3; } }",
+  "  if (sc4 >= threshold) { count++; if (sc4 > bestScore) { bestCI = 4; bestScore = sc4; } }",
+  "  if (count == 0) { gl_FragColor = vec4(0.0); return; }",
+  _glslPickColor,
+  "  float alpha = (count == 1) ? 0.55 : 0.20;",
+  "  gl_FragColor = vec4(color, alpha);",
+  "}"
+].join("\n");
+
+// -- 8. Conformal APS — sorting network for cumulative probs ------------------
+var _shaderFragConformalAPS = [
+  "precision highp float;",
+  "uniform vec3 classW[5];",
+  "uniform float classB[5];",
+  "uniform float threshold;",  // = 1 - qhat
+  "uniform vec3 classColors[5];",
+  "varying vec2 vUv;",
+  _glslDirFromUV,
+  "void main() {",
+  "  vec3 x = dirFromUV(vUv);",
+  // Compute softmax probabilities
+  "  float l0 = dot(classW[0], x) + classB[0];",
+  "  float l1 = dot(classW[1], x) + classB[1];",
+  "  float l2 = dot(classW[2], x) + classB[2];",
+  "  float l3 = dot(classW[3], x) + classB[3];",
+  "  float l4 = dot(classW[4], x) + classB[4];",
+  "  float maxL = max(max(max(max(l0,l1),l2),l3),l4);",
+  "  float e0 = exp(l0-maxL); float e1 = exp(l1-maxL);",
+  "  float e2 = exp(l2-maxL); float e3 = exp(l3-maxL); float e4 = exp(l4-maxL);",
+  "  float sumE = e0+e1+e2+e3+e4;",
+  "  float pr0 = e0/sumE; float pr1 = e1/sumE; float pr2 = e2/sumE;",
+  "  float pr3 = e3/sumE; float pr4 = e4/sumE;",
+  // Hand-inlined insertion sort of 5 probabilities (descending order)
+  // We sort (val, idx) pairs to track which class each rank corresponds to
+  // Use parallel arrays: v[5] for values, idx for original indices
+  "  float v0=pr0, v1=pr1, v2=pr2, v3=pr3, v4=pr4;",
+  "  int i0=0, i1=1, i2=2, i3=3, i4=4;",
+  // Sort descending: bubble sort network (10 compare-swaps for 5 elements)
+  "  float tmpV; int tmpI;",
+  // Pass 1
+  "  if (v0 < v1) { tmpV=v0; v0=v1; v1=tmpV; tmpI=i0; i0=i1; i1=tmpI; }",
+  "  if (v1 < v2) { tmpV=v1; v1=v2; v2=tmpV; tmpI=i1; i1=i2; i2=tmpI; }",
+  "  if (v2 < v3) { tmpV=v2; v2=v3; v3=tmpV; tmpI=i2; i2=i3; i3=tmpI; }",
+  "  if (v3 < v4) { tmpV=v3; v3=v4; v4=tmpV; tmpI=i3; i3=i4; i4=tmpI; }",
+  // Pass 2
+  "  if (v0 < v1) { tmpV=v0; v0=v1; v1=tmpV; tmpI=i0; i0=i1; i1=tmpI; }",
+  "  if (v1 < v2) { tmpV=v1; v1=v2; v2=tmpV; tmpI=i1; i1=i2; i2=tmpI; }",
+  "  if (v2 < v3) { tmpV=v2; v2=v3; v3=tmpV; tmpI=i2; i2=i3; i3=tmpI; }",
+  // Pass 3
+  "  if (v0 < v1) { tmpV=v0; v0=v1; v1=tmpV; tmpI=i0; i0=i1; i1=tmpI; }",
+  "  if (v1 < v2) { tmpV=v1; v1=v2; v2=tmpV; tmpI=i1; i1=i2; i2=tmpI; }",
+  // Pass 4
+  "  if (v0 < v1) { tmpV=v0; v0=v1; v1=tmpV; tmpI=i0; i0=i1; i1=tmpI; }",
+  // Now v0 >= v1 >= v2 >= v3 >= v4 with corresponding indices i0..i4
+  // Compute APS inclusion scores: score[k] = 1 - cumProbAbove[k]
+  // For rank 0 (highest prob): cumProbAbove = 0, score = 1
+  // For rank 1: cumProbAbove = v0, score = 1 - v0
+  // For rank r: cumProbAbove = sum of v[0..r-1]
+  "  float cum0 = 0.0;",
+  "  float cum1 = v0;",
+  "  float cum2 = v0 + v1;",
+  "  float cum3 = v0 + v1 + v2;",
+  "  float cum4 = v0 + v1 + v2 + v3;",
+  // Map back: for each original class, find its inclusion score
+  // aps[original_class] = 1 - cumProbAbove[rank_of_that_class]
+  "  float aps0, aps1, aps2, aps3, aps4;",
+  // Rank 0 → original class i0
+  "  aps0 = 0.0; aps1 = 0.0; aps2 = 0.0; aps3 = 0.0; aps4 = 0.0;",
+  "  if (i0==0) aps0 = 1.0-cum0; else if (i0==1) aps1 = 1.0-cum0; else if (i0==2) aps2 = 1.0-cum0; else if (i0==3) aps3 = 1.0-cum0; else aps4 = 1.0-cum0;",
+  "  if (i1==0) aps0 = 1.0-cum1; else if (i1==1) aps1 = 1.0-cum1; else if (i1==2) aps2 = 1.0-cum1; else if (i1==3) aps3 = 1.0-cum1; else aps4 = 1.0-cum1;",
+  "  if (i2==0) aps0 = 1.0-cum2; else if (i2==1) aps1 = 1.0-cum2; else if (i2==2) aps2 = 1.0-cum2; else if (i2==3) aps3 = 1.0-cum2; else aps4 = 1.0-cum2;",
+  "  if (i3==0) aps0 = 1.0-cum3; else if (i3==1) aps1 = 1.0-cum3; else if (i3==2) aps2 = 1.0-cum3; else if (i3==3) aps3 = 1.0-cum3; else aps4 = 1.0-cum3;",
+  "  if (i4==0) aps0 = 1.0-cum4; else if (i4==1) aps1 = 1.0-cum4; else if (i4==2) aps2 = 1.0-cum4; else if (i4==3) aps3 = 1.0-cum4; else aps4 = 1.0-cum4;",
+  // Count and find best class in prediction set
+  "  int bestCI = -1; float bestScore = -1.0; int count = 0;",
+  "  if (aps0 >= threshold) { count++; if (aps0 > bestScore) { bestCI = 0; bestScore = aps0; } }",
+  "  if (aps1 >= threshold) { count++; if (aps1 > bestScore) { bestCI = 1; bestScore = aps1; } }",
+  "  if (aps2 >= threshold) { count++; if (aps2 > bestScore) { bestCI = 2; bestScore = aps2; } }",
+  "  if (aps3 >= threshold) { count++; if (aps3 > bestScore) { bestCI = 3; bestScore = aps3; } }",
+  "  if (aps4 >= threshold) { count++; if (aps4 > bestScore) { bestCI = 4; bestScore = aps4; } }",
+  "  if (count == 0) { gl_FragColor = vec4(0.0); return; }",
+  _glslPickColor,
+  "  float alpha = (count == 1) ? 0.55 : 0.20;",
+  "  gl_FragColor = vec4(color, alpha);",
+  "}"
+].join("\n");
+
+// ══════════════════════════════════════════════
+//  PROCEDURAL SHADER INFRASTRUCTURE
+// ══════════════════════════════════════════════
+
+// Set of all methods that use procedural (non-texture) shaders
+var _proceduralMethods = new Set([
+  "msp", "mls", "ebo", "ts", "odin", "vim", "cos", "vmf", "kent", "rmds",
+  "fc-msp", "fc-mls", "fc-ebo", "fc-ts", "fc-odin", "fc-vim",
+  "fc-cos", "fc-vmf", "fc-kent"
+]);
+
+// Cache: method key → { mesh, material }
+var _proceduralCache = new Map();
+
+// Returns { shaderType: string, uniforms: object } for a method
+function _getProceduralConfig(method) {
+  var isFC = method.indexOf("fc-") === 0;
+  var base = isFC ? method.slice(3) : method;
+  var thr = cachedThr;
+
+  switch (base) {
+    case "msp": {
+      var wArr, bArr, scoreMode;
+      if (isFC) {
+        wArr = fc.W.map(function(w) { return new THREE.Vector3(w[0], w[1], w[2]); });
+        bArr = fc.B.slice();
+        scoreMode = 0;
+      } else {
+        wArr = W.map(function(w) { return new THREE.Vector3(w[0]*TAU, w[1]*TAU, w[2]*TAU); });
+        bArr = [0, 0, 0, 0, 0];
+        scoreMode = 0;
+      }
+      return {
+        shaderType: "logit",
+        uniforms: {
+          classW: { value: wArr },
+          classB: { value: bArr },
+          threshold: { value: isFC ? thr.fcMspGamma : thr.mspGamma },
+          classColors: { value: _classColorsVec3 },
+          scoreMode: { value: scoreMode }
+        }
+      };
+    }
+    case "mls": {
+      var wArr, bArr;
+      if (isFC) {
+        wArr = fc.W.map(function(w) { return new THREE.Vector3(w[0], w[1], w[2]); });
+        bArr = fc.B.slice();
+      } else {
+        wArr = W.map(function(w) { return new THREE.Vector3(w[0]*TAU, w[1]*TAU, w[2]*TAU); });
+        bArr = [0, 0, 0, 0, 0];
+      }
+      return {
+        shaderType: "logit",
+        uniforms: {
+          classW: { value: wArr },
+          classB: { value: bArr },
+          threshold: { value: isFC ? thr.fcMlsThr : thr.mlsThr },
+          classColors: { value: _classColorsVec3 },
+          scoreMode: { value: 1 }
+        }
+      };
+    }
+    case "ebo": {
+      var wArr, bArr;
+      if (isFC) {
+        wArr = fc.W.map(function(w) { return new THREE.Vector3(w[0], w[1], w[2]); });
+        bArr = fc.B.slice();
+      } else {
+        wArr = W.map(function(w) { return new THREE.Vector3(w[0]*TAU, w[1]*TAU, w[2]*TAU); });
+        bArr = [0, 0, 0, 0, 0];
+      }
+      return {
+        shaderType: "logit",
+        uniforms: {
+          classW: { value: wArr },
+          classB: { value: bArr },
+          threshold: { value: isFC ? thr.fcEboThr : thr.eboThr },
+          classColors: { value: _classColorsVec3 },
+          scoreMode: { value: 2 }
+        }
+      };
+    }
+    case "ts": {
+      var wArr, bArr;
+      if (isFC) {
+        // FC TS: pre-scale W by 1/bestT, B by 1/bestT
+        var T = fc.bestT;
+        wArr = fc.W.map(function(w) { return new THREE.Vector3(w[0]/T, w[1]/T, w[2]/T); });
+        bArr = fc.B.map(function(b) { return b / T; });
+      } else {
+        // Proto TS: pre-scale W by TAU/bestT (no biases)
+        var T = bestT;
+        wArr = W.map(function(w) { return new THREE.Vector3(w[0]*TAU/T, w[1]*TAU/T, w[2]*TAU/T); });
+        bArr = [0, 0, 0, 0, 0];
+      }
+      return {
+        shaderType: "logit",
+        uniforms: {
+          classW: { value: wArr },
+          classB: { value: bArr },
+          threshold: { value: isFC ? thr.fcTsGamma : thr.tsGamma },
+          classColors: { value: _classColorsVec3 },
+          scoreMode: { value: 0 }  // TS uses softmax-max like MSP
+        }
+      };
+    }
+    case "cos": {
+      var dirs, kappas, perThr;
+      if (isFC) {
+        dirs = fc.wDirs.map(function(d) { return new THREE.Vector3(d[0], d[1], d[2]); });
+        kappas = [1, 1, 1, 1, 1];
+        perThr = thr.fcCosPerClass.slice();
+      } else {
+        dirs = classes.map(function(c) { return new THREE.Vector3(c.muHat[0], c.muHat[1], c.muHat[2]); });
+        kappas = [1, 1, 1, 1, 1];
+        perThr = thr.cosPerClass.slice();
+      }
+      return {
+        shaderType: "cosVMF",
+        uniforms: {
+          classDir: { value: dirs },
+          classKappa: { value: kappas },
+          perClassThr: { value: perThr },
+          classColors: { value: _classColorsVec3 },
+          isGradient: { value: 0.0 },
+          maxTrainScores: { value: [1, 1, 1, 1, 1] }
+        }
+      };
+    }
+    case "vmf": {
+      var dirs, kappas, perThr, maxTS;
+      if (isFC) {
+        dirs = fc.wDirs.map(function(d) { return new THREE.Vector3(d[0], d[1], d[2]); });
+        kappas = fc.fcKappas.slice();
+        perThr = thr.fcVmfBands.map(function(b) { return b[0]; });
+        maxTS = _getMaxTrainScoresPerClass("fc-vmf");
+      } else {
+        dirs = classes.map(function(c) { return new THREE.Vector3(c.muHat[0], c.muHat[1], c.muHat[2]); });
+        kappas = classes.map(function(c) { return c.kappa; });
+        perThr = thr.vmfBands.map(function(b) { return b[0]; });
+        maxTS = _getMaxTrainScoresPerClass("vmf");
+      }
+      return {
+        shaderType: "cosVMF",
+        uniforms: {
+          classDir: { value: dirs },
+          classKappa: { value: kappas },
+          perClassThr: { value: perThr },
+          classColors: { value: _classColorsVec3 },
+          isGradient: { value: 1.0 },
+          maxTrainScores: { value: maxTS }
+        }
+      };
+    }
+    case "kent": {
+      var g1, g2, kappas, betas, perThr, maxTS;
+      if (isFC) {
+        g1 = fc.fcKents.map(function(k) { return new THREE.Vector3(k.gamma1[0], k.gamma1[1], k.gamma1[2]); });
+        g2 = fc.fcKents.map(function(k) { return new THREE.Vector3(k.gamma2[0], k.gamma2[1], k.gamma2[2]); });
+        kappas = fc.fcKents.map(function(k) { return k.kappa; });
+        betas = fc.fcKents.map(function(k) { return k.beta; });
+        perThr = thr.fcKentBands.map(function(b) { return b[0]; });
+        maxTS = _getMaxTrainScoresPerClass("fc-kent");
+      } else {
+        g1 = classes.map(function(c) { return new THREE.Vector3(c.kent.gamma1[0], c.kent.gamma1[1], c.kent.gamma1[2]); });
+        g2 = classes.map(function(c) { return new THREE.Vector3(c.kent.gamma2[0], c.kent.gamma2[1], c.kent.gamma2[2]); });
+        kappas = classes.map(function(c) { return c.kent.kappa; });
+        betas = classes.map(function(c) { return c.kent.beta; });
+        perThr = thr.kentBands.map(function(b) { return b[0]; });
+        maxTS = _getMaxTrainScoresPerClass("kent");
+      }
+      return {
+        shaderType: "kent",
+        uniforms: {
+          kentGamma1: { value: g1 },
+          kentGamma2: { value: g2 },
+          kentKappa: { value: kappas },
+          kentBeta: { value: betas },
+          perClassThr: { value: perThr },
+          classColors: { value: _classColorsVec3 },
+          isGradient: { value: 1.0 },
+          maxTrainScores: { value: maxTS }
+        }
+      };
+    }
+    case "odin": {
+      var wArr, bArr;
+      if (isFC) {
+        wArr = fc.W.map(function(w) { return new THREE.Vector3(w[0], w[1], w[2]); });
+        bArr = fc.B.slice();
+      } else {
+        // Proto ODIN uses TAU-scaled weights (protoOdinWeights) but logits are TAU*dot(W,x)
+        wArr = W.map(function(w) { return new THREE.Vector3(w[0]*TAU, w[1]*TAU, w[2]*TAU); });
+        bArr = [0, 0, 0, 0, 0];
+      }
+      return {
+        shaderType: "odin",
+        uniforms: {
+          classW: { value: wArr },
+          classB: { value: bArr },
+          odinT: { value: odinT },
+          odinEps: { value: odinEps },
+          threshold: { value: isFC ? thr.fcOdinGamma : thr.odinGamma },
+          classColors: { value: _classColorsVec3 }
+        }
+      };
+    }
+    case "vim": {
+      var wArr, bArr, alphaVal;
+      if (isFC) {
+        wArr = fc.W.map(function(w) { return new THREE.Vector3(w[0], w[1], w[2]); });
+        bArr = fc.B.slice();
+        alphaVal = fcVimAlphaVal;
+      } else {
+        wArr = W.map(function(w) { return new THREE.Vector3(w[0]*TAU, w[1]*TAU, w[2]*TAU); });
+        bArr = [0, 0, 0, 0, 0];
+        alphaVal = vimAlpha;
+      }
+      return {
+        shaderType: "vim",
+        uniforms: {
+          classW: { value: wArr },
+          classB: { value: bArr },
+          vimU0: { value: new THREE.Vector3(vimU[0][0], vimU[0][1], vimU[0][2]) },
+          vimU1: { value: new THREE.Vector3(vimU[1][0], vimU[1][1], vimU[1][2]) },
+          muAll: { value: new THREE.Vector3(muAll[0], muAll[1], muAll[2]) },
+          vimAlphaU: { value: alphaVal },
+          threshold: { value: isFC ? thr.fcVimThr : thr.vimThr },
+          classColors: { value: _classColorsVec3 }
+        }
+      };
+    }
+    case "rmds": {
+      // poolInvCov is a 3x3 array-of-arrays → mat3
+      var ic = poolInvCov;
+      var m = new THREE.Matrix3();
+      m.set(ic[0][0], ic[0][1], ic[0][2],
+            ic[1][0], ic[1][1], ic[1][2],
+            ic[2][0], ic[2][1], ic[2][2]);
+      return {
+        shaderType: "rmds",
+        uniforms: {
+          invCov: { value: m },
+          classMeans: { value: classes.map(function(c) { return new THREE.Vector3(c.muBar[0], c.muBar[1], c.muBar[2]); }) },
+          globalMean: { value: new THREE.Vector3(muAll[0], muAll[1], muAll[2]) },
+          threshold: { value: thr.rmdsThr },
+          classColors: { value: _classColorsVec3 }
+        }
+      };
+    }
+    default:
+      return null;
+  }
+}
+
+// Shader type → GLSL fragment shader string
+var _proceduralShaderMap = {
+  logit: _shaderFragLogit,
+  cosVMF: _shaderFragCosVMF,
+  kent: _shaderFragKent,
+  odin: _shaderFragODIN,
+  vim: _shaderFragViM,
+  rmds: _shaderFragRMDS
+};
+
+// Create ShaderMaterial + Mesh for a procedural method
+function _buildProceduralMesh(method) {
+  var config = _getProceduralConfig(method);
+  if (!config) return null;
+  var fragShader = _proceduralShaderMap[config.shaderType];
+  var material = new THREE.ShaderMaterial({
+    uniforms: config.uniforms,
+    vertexShader: _shaderVert,
+    fragmentShader: fragShader,
+    transparent: true,
+    side: THREE.FrontSide,
+    depthWrite: false
+  });
+  var mesh = new THREE.Mesh(_sharedOverlayGeo, material);
+  var key = _shaderMethodKey(method);
+  _proceduralCache.set(key, { mesh: mesh, material: material });
+  return { mesh: mesh, material: material };
+}
+
+// Update threshold and parameter uniforms when q changes
+function _updateProceduralUniforms(method, thr) {
+  var key = _shaderMethodKey(method);
+  var entry = _proceduralCache.get(key);
+  if (!entry) return false;
+  var mat = entry.material;
+  var isFC = method.indexOf("fc-") === 0;
+  var base = isFC ? method.slice(3) : method;
+
+  switch (base) {
+    case "msp":
+      mat.uniforms.threshold.value = isFC ? thr.fcMspGamma : thr.mspGamma;
+      break;
+    case "mls":
+      mat.uniforms.threshold.value = isFC ? thr.fcMlsThr : thr.mlsThr;
+      break;
+    case "ebo":
+      mat.uniforms.threshold.value = isFC ? thr.fcEboThr : thr.eboThr;
+      break;
+    case "ts":
+      mat.uniforms.threshold.value = isFC ? thr.fcTsGamma : thr.tsGamma;
+      break;
+    case "odin":
+      mat.uniforms.threshold.value = isFC ? thr.fcOdinGamma : thr.odinGamma;
+      break;
+    case "vim":
+      mat.uniforms.threshold.value = isFC ? thr.fcVimThr : thr.vimThr;
+      break;
+    case "rmds":
+      mat.uniforms.threshold.value = thr.rmdsThr;
+      break;
+    case "cos":
+      mat.uniforms.perClassThr.value = isFC ? thr.fcCosPerClass.slice() : thr.cosPerClass.slice();
+      break;
+    case "vmf":
+      mat.uniforms.perClassThr.value = isFC
+        ? thr.fcVmfBands.map(function(b) { return b[0]; })
+        : thr.vmfBands.map(function(b) { return b[0]; });
+      break;
+    case "kent":
+      mat.uniforms.perClassThr.value = isFC
+        ? thr.fcKentBands.map(function(b) { return b[0]; })
+        : thr.kentBands.map(function(b) { return b[0]; });
+      break;
+  }
+  return true;
+}
+
+// Conformal procedural shader cache and helpers
+var _cpProceduralCache = new Map();  // cpShaderKey → { mesh, material }
+
+// Build a conformal procedural shader mesh
+function _buildConformalProceduralMesh(mode, scoreType, balanced) {
+  var isFC = (mode === "cp-fc");
+  var fragShader, uniforms;
+
+  if (scoreType === "aps") {
+    fragShader = _shaderFragConformalAPS;
+    var wArr, bArr;
+    if (isFC) {
+      var variant = balanced ? fcBal : fcUnbal;
+      wArr = variant.W.map(function(w) { return new THREE.Vector3(w[0], w[1], w[2]); });
+      bArr = variant.B.slice();
+    } else {
+      wArr = W.map(function(w) { return new THREE.Vector3(w[0]*TAU, w[1]*TAU, w[2]*TAU); });
+      bArr = [0, 0, 0, 0, 0];
+    }
+    uniforms = {
+      classW: { value: wArr },
+      classB: { value: bArr },
+      threshold: { value: 0.5 },
+      classColors: { value: _classColorsVec3 }
+    };
+  } else {
+    // MSP or EMB
+    fragShader = _shaderFragConformalMSPEmb;
+    var wArr, bArr;
+    if (isFC) {
+      var variant = balanced ? fcBal : fcUnbal;
+      wArr = variant.W.map(function(w) { return new THREE.Vector3(w[0], w[1], w[2]); });
+      bArr = variant.B.slice();
+    } else {
+      wArr = W.map(function(w) { return new THREE.Vector3(w[0]*TAU, w[1]*TAU, w[2]*TAU); });
+      bArr = [0, 0, 0, 0, 0];
+    }
+    uniforms = {
+      classW: { value: wArr },
+      classB: { value: bArr },
+      classMuHat: { value: classes.map(function(c) { return new THREE.Vector3(c.muHat[0], c.muHat[1], c.muHat[2]); }) },
+      threshold: { value: 0.5 },
+      classColors: { value: _classColorsVec3 },
+      scoreMode: { value: scoreType === "emb" ? 1 : 0 }
+    };
+  }
+
+  var material = new THREE.ShaderMaterial({
+    uniforms: uniforms,
+    vertexShader: _shaderVert,
+    fragmentShader: fragShader,
+    transparent: true,
+    side: THREE.FrontSide,
+    depthWrite: false
+  });
+  var mesh = new THREE.Mesh(_sharedOverlayGeo, material);
+  var key = _cpShaderKey(mode, scoreType, balanced);
+  _cpProceduralCache.set(key, { mesh: mesh, material: material });
+  return { mesh: mesh, material: material };
+}
+
+// Update conformal procedural shader threshold when alpha changes
+function _updateConformalProceduralUniforms(mode) {
+  var key = _cpShaderKey(mode, cpScoreType, fcBalanced);
+  var entry = _cpProceduralCache.get(key);
+  if (!entry) return false;
+  var qhat = _cpQhat(mode, cpScoreType, fcBalanced, cpAlpha);
+  entry.material.uniforms.threshold.value = 1 - qhat;
+  return true;
+}
+
+// -- Type A fragment shader ------------------------------------------------
+var _shaderFragA = [
+  "uniform sampler2D scoreMap;",
+  "uniform sampler2D classIdxMap;",
+  "uniform float threshold;",
+  "uniform vec3 classColors[5];",
+  "uniform float isGradient;",
+  "uniform float maxTrainScore;",
+  "uniform float invertThreshold;",  // 1.0 for KNN/RMDS (lower = in-dist)
+  "varying vec2 vUv;",
+  "void main() {",
+  "  float score = texture2D(scoreMap, vUv).r;",
+  "  float cidxRaw = texture2D(classIdxMap, vUv).r;",
+  "  int ci = int(cidxRaw * 255.0 + 0.5);",
+  "  bool pass = (invertThreshold > 0.5) ? (score <= threshold) : (score >= threshold);",
+  "  if (pass) {",
+  "    vec3 color = classColors[0];",
+  "    if (ci == 1) color = classColors[1];",
+  "    else if (ci == 2) color = classColors[2];",
+  "    else if (ci == 3) color = classColors[3];",
+  "    else if (ci == 4) color = classColors[4];",
+  "    float alpha = 0.55;",
+  "    if (isGradient > 0.5) {",
+  "      float denom = maxTrainScore - threshold;",
+  "      if (invertThreshold > 0.5) denom = threshold - maxTrainScore;",
+  "      float t = 0.0;",
+  "      if (abs(denom) > 0.0001) {",
+  "        if (invertThreshold > 0.5) t = (threshold - score) / denom;",
+  "        else t = (score - threshold) / denom;",
+  "      }",
+  "      alpha = 0.01 + 0.74 * clamp(t, 0.0, 1.0);",
+  "    }",
+  "    gl_FragColor = vec4(color, alpha);",
+  "  } else {",
+  "    gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);",
+  "  }",
+  "}"
+].join("\n");
+
+// -- Type B fragment shader (per-class thresholds, ratio overlap) ----------
+var _shaderFragB = [
+  "uniform sampler2D scores04;",
+  "uniform sampler2D score4;",
+  "uniform float perClassThr[5];",
+  "uniform vec3 classColors[5];",
+  "uniform float isGradient;",
+  "uniform float maxTrainScores[5];",
+  "varying vec2 vUv;",
+  "void main() {",
+  "  vec4 s04 = texture2D(scores04, vUv);",
+  "  float s4val = texture2D(score4, vUv).r;",
+  "  float scores[5];",
+  "  scores[0] = s04.r; scores[1] = s04.g; scores[2] = s04.b; scores[3] = s04.a; scores[4] = s4val;",
+  "  int bestCI = -1;",
+  "  float bestRatio = -100000.0;",
+  "  float bestScore = 0.0;",
+  "  for (int ci = 0; ci < 5; ci++) {",
+  "    if (scores[ci] >= perClassThr[ci]) {",
+  "      float ratio = scores[ci] / max(perClassThr[ci], 0.0000001);",
+  "      if (ratio > bestRatio) {",
+  "        bestCI = ci;",
+  "        bestRatio = ratio;",
+  "        bestScore = scores[ci];",
+  "      }",
+  "    }",
+  "  }",
+  "  if (bestCI >= 0) {",
+  "    vec3 color = classColors[0];",
+  "    if (bestCI == 1) color = classColors[1];",
+  "    else if (bestCI == 2) color = classColors[2];",
+  "    else if (bestCI == 3) color = classColors[3];",
+  "    else if (bestCI == 4) color = classColors[4];",
+  "    float alpha = 0.55;",
+  "    if (isGradient > 0.5) {",
+  "      float thr = perClassThr[0];",
+  "      float mts = maxTrainScores[0];",
+  "      if (bestCI == 1) { thr = perClassThr[1]; mts = maxTrainScores[1]; }",
+  "      else if (bestCI == 2) { thr = perClassThr[2]; mts = maxTrainScores[2]; }",
+  "      else if (bestCI == 3) { thr = perClassThr[3]; mts = maxTrainScores[3]; }",
+  "      else if (bestCI == 4) { thr = perClassThr[4]; mts = maxTrainScores[4]; }",
+  "      float t = (mts > thr + 0.0001) ? (bestScore - thr) / (mts - thr) : 1.0;",
+  "      alpha = 0.01 + 0.74 * clamp(t, 0.0, 1.0);",
+  "    }",
+  "    gl_FragColor = vec4(color, alpha);",
+  "  } else {",
+  "    gl_FragColor = vec4(0.0);",
+  "  }",
+  "}"
+].join("\n");
+
+// -- Per-method score field cache ------------------------------------------
+// Maps method key (e.g. "msp", "fc-mls-true") to:
+//   { type: "A"|"B", mesh, material, scoreData, classIdxData, ... }
+var _shaderCache = new Map();
+
+function _shaderMethodKey(method) {
+  if (fcModes2.has(method)) return method + "-" + fcBalanced;
+  return method;
+}
+
+// Class colors as normalized RGB vectors
+var _classColorsVec3 = classes.map(function(c) {
+  var rgb = hexToRGB(c.color);
+  return new THREE.Vector3(rgb[0] / 255.0, rgb[1] / 255.0, rgb[2] / 255.0);
+});
+
+// -- Score field computation (async chunked) -------------------------------
+// Type A: returns { classIdx: Uint8Array, scores: Float32Array }
+// Type B: returns { scores: Float32Array } (interleaved 5 floats per pixel)
+function computeScoreFieldAsync(method, _unused, w, h, onDone) {
+  // Note: threshold (2nd arg) is not used -- score fields are threshold-independent.
+  // The threshold is applied by the GPU shader at render time.
+  var isTypeB = _shaderTypeB.has(method);
+  var totalPx = w * h;
+  var classIdx, scores;
+
+  if (isTypeB) {
+    scores = new Float32Array(totalPx * 5);
+  } else {
+    classIdx = new Uint8Array(totalPx);
+    scores = new Float32Array(totalPx);
+  }
+
+  var py = 0;
+  var ROWS = 8;
+
+  function chunk() {
+    var end = Math.min(py + ROWS, h);
+    for (; py < end; py++) {
+      for (var px = 0; px < w; px++) {
+        var u = px / w;
+        var v = py / h;
+        var dir = dirFromUV(u, v);
+        var pidx = py * w + px;
+
+        if (isTypeB) {
+          // Compute per-class scores
+          var perClass = _computePerClassScores(method, dir);
+          for (var ci2 = 0; ci2 < 5; ci2++) {
+            scores[pidx * 5 + ci2] = perClass[ci2];
+          }
+        } else {
+          // Compute single score + winning class
+          var result = _computeSingleScore(method, dir);
+          classIdx[pidx] = result.classIdx;
+          scores[pidx] = result.score;
+        }
+      }
+    }
+    if (py < h) requestAnimationFrame(chunk);
+    else {
+      if (isTypeB) onDone({ type: "B", scores: scores });
+      else onDone({ type: "A", classIdx: classIdx, scores: scores });
+    }
+  }
+  requestAnimationFrame(chunk);
+}
+
+// Compute single score + classIdx for precomputed methods (KNN/KDE)
+function _computeSingleScore(method, dir) {
+  var logits, probs, a, r;
+  switch (method) {
+    case "msp":
+      logits = W.map(function(w) { return TAU * v3dot(dir, w); });
+      probs = softmax(logits);
+      a = 0; for (var i = 1; i < probs.length; i++) if (probs[i] > probs[a]) a = i;
+      return { classIdx: a, score: probs[a] };
+    case "mls":
+      logits = W.map(function(w) { return TAU * v3dot(dir, w); });
+      a = 0; for (var i = 1; i < logits.length; i++) if (logits[i] > logits[a]) a = i;
+      return { classIdx: a, score: logits[a] };
+    case "ebo":
+      logits = W.map(function(w) { return TAU * v3dot(dir, w); });
+      a = 0; for (var i = 1; i < logits.length; i++) if (logits[i] > logits[a]) a = i;
+      return { classIdx: a, score: logsumexp(logits) };
+    case "ts":
+      logits = W.map(function(w) { return (TAU / bestT) * v3dot(dir, w); });
+      probs = softmax(logits);
+      a = 0; for (var i = 1; i < probs.length; i++) if (probs[i] > probs[a]) a = i;
+      return { classIdx: a, score: probs[a] };
+    case "odin":
+      r = odinScore(dir, protoGetLogits, protoOdinWeights, odinT, odinEps);
+      return { classIdx: r.argmax, score: r.score };
+    case "vim":
+      r = vimScoreFn(dir, protoGetLogits);
+      return { classIdx: r.argmax, score: r.energy };
+    case "knn":
+      r = knnResult(dir);
+      return { classIdx: r.nearestLabel, score: r.kthDist };
+    case "rmds":
+      r = rmdsScore(dir);
+      return { classIdx: r.bestClass, score: r.score };
+    case "kde":
+      r = kdeScore(dir);
+      return { classIdx: r.bestClass, score: r.density };
+    case "fc-msp":
+      logits = fc.logitsFn(dir); probs = softmax(logits);
+      a = 0; for (var i = 1; i < probs.length; i++) if (probs[i] > probs[a]) a = i;
+      return { classIdx: a, score: probs[a] };
+    case "fc-mls":
+      logits = fc.logitsFn(dir);
+      a = 0; for (var i = 1; i < logits.length; i++) if (logits[i] > logits[a]) a = i;
+      return { classIdx: a, score: logits[a] };
+    case "fc-ebo":
+      logits = fc.logitsFn(dir);
+      a = 0; for (var i = 1; i < logits.length; i++) if (logits[i] > logits[a]) a = i;
+      return { classIdx: a, score: logsumexp(logits) };
+    case "fc-ts":
+      logits = fc.logitsFn(dir);
+      probs = softmax(logits.map(function(l) { return l / fc.bestT; }));
+      a = 0; for (var i = 1; i < probs.length; i++) if (probs[i] > probs[a]) a = i;
+      return { classIdx: a, score: probs[a] };
+    case "fc-odin":
+      r = odinScore(dir, fc.logitsFn, fc.W, odinT, odinEps);
+      return { classIdx: r.argmax, score: r.score };
+    case "fc-vim":
+      r = fcVimScoreFn(dir);
+      return { classIdx: r.argmax, score: r.energy };
+    default:
+      return { classIdx: 0, score: 0 };
+  }
+}
+
+// -- Create DataTextures from score field data -----------------------------
+function _createTypeATextures(data, w, h) {
+  // classIdx as Uint8 R-channel texture (class index 0-4 per pixel)
+  var classIdxTex = new THREE.DataTexture(data.classIdx, w, h, THREE.RedFormat, THREE.UnsignedByteType);
+  classIdxTex.minFilter = THREE.NearestFilter;
+  classIdxTex.magFilter = THREE.NearestFilter;
+  classIdxTex.flipY = true;
+  classIdxTex.needsUpdate = true;
+
+  // score as Float32 R-channel texture (one score per pixel)
+  var scoreTex = new THREE.DataTexture(data.scores, w, h, THREE.RedFormat, THREE.FloatType);
+  scoreTex.minFilter = THREE.NearestFilter;
+  scoreTex.magFilter = THREE.NearestFilter;
+  scoreTex.flipY = true;
+  scoreTex.needsUpdate = true;
+
+  return { classIdxTex: classIdxTex, scoreTex: scoreTex };
+}
+
+// -- Get threshold values for a method from the threshold object -----------
+function _getShaderThreshold(method, thr) {
+  switch (method) {
+    case "msp": return thr.mspGamma;
+    case "mls": return thr.mlsThr;
+    case "ebo": return thr.eboThr;
+    case "ts": return thr.tsGamma;
+    case "odin": return thr.odinGamma;
+    case "vim": return thr.vimThr;
+    case "knn": return thr.knnThr;
+    case "rmds": return thr.rmdsThr;
+    case "kde": return thr.kdeThr;
+    case "fc-msp": return thr.fcMspGamma;
+    case "fc-mls": return thr.fcMlsThr;
+    case "fc-ebo": return thr.fcEboThr;
+    case "fc-ts": return thr.fcTsGamma;
+    case "fc-odin": return thr.fcOdinGamma;
+    case "fc-vim": return thr.fcVimThr;
+    default: return 0;
+  }
+}
+
+function _getShaderPerClassThresholds(method, thr) {
+  switch (method) {
+    case "cos": return thr.cosPerClass;
+    case "vmf": return thr.vmfBands.map(function(b) { return b[0]; });
+    case "kent": return thr.kentBands.map(function(b) { return b[0]; });
+    case "fc-cos": return thr.fcCosPerClass;
+    case "fc-vmf": return thr.fcVmfBands.map(function(b) { return b[0]; });
+    case "fc-kent": return thr.fcKentBands.map(function(b) { return b[0]; });
+    default: return [0,0,0,0,0];
+  }
+}
+
+function _getMaxTrainScore(method) {
+  // For gradient methods: the max training score (per-class for Type B)
+  switch (method) {
+    case "kde": return Math.max.apply(null, trainKDEscores);
+    default: return 1.0;
+  }
+}
+
+function _getMaxTrainScoresPerClass(method) {
+  switch (method) {
+    case "vmf":
+      return classes.map(function(c) { return Math.max.apply(null, c.vmScores); });
+    case "kent":
+      return classes.map(function(c) { return Math.max.apply(null, c.kentScores); });
+    case "fc-vmf":
+      return classes.map(function(c, ci) {
+        return Math.max.apply(null, c.points.map(function(pt) { return fc.fcKappas[ci] * v3dot(pt, fc.wDirs[ci]); }));
+      });
+    case "fc-kent":
+      return classes.map(function(c, ci) {
+        return Math.max.apply(null, c.points.map(function(pt) { return fc.fcKents[ci].kentScore(pt); }));
+      });
+    default: return [1,1,1,1,1];
+  }
+}
+
+// Is the threshold inverted? (lower score = more in-distribution)
+function _isInvertedThreshold(method) {
+  return method === "knn" || method === "rmds";
+}
+
+// -- Create ShaderMaterial + mesh for a computed score field ----------------
+function _buildShaderMesh(method, scoreData, w, h) {
+  var isTypeB = _shaderTypeB.has(method);
+  var isGrad = _shaderGradient.has(method);
+  var geo = _sharedOverlayGeo;
+  var material;
+
+  if (isTypeB) {
+    var textures = _createTypeBTextures(scoreData, w, h);
+    var maxTS = _getMaxTrainScoresPerClass(method);
+    var perClassThr = _getShaderPerClassThresholds(method, cachedThr);
+    material = new THREE.ShaderMaterial({
+      uniforms: {
+        scores04: { value: textures.scores04Tex },
+        score4: { value: textures.score4Tex },
+        perClassThr: { value: perClassThr },
+        classColors: { value: _classColorsVec3 },
+        isGradient: { value: isGrad ? 1.0 : 0.0 },
+        maxTrainScores: { value: maxTS }
+      },
+      vertexShader: _shaderVert,
+      fragmentShader: _shaderFragB,
+      transparent: true,
+      side: THREE.FrontSide,
+      depthWrite: false
+    });
+  } else {
+    var textures = _createTypeATextures(scoreData, w, h);
+    var thr = _getShaderThreshold(method, cachedThr);
+    var inverted = _isInvertedThreshold(method);
+    material = new THREE.ShaderMaterial({
+      uniforms: {
+        scoreMap: { value: textures.scoreTex },
+        classIdxMap: { value: textures.classIdxTex },
+        threshold: { value: thr },
+        classColors: { value: _classColorsVec3 },
+        isGradient: { value: isGrad ? 1.0 : 0.0 },
+        maxTrainScore: { value: _getMaxTrainScore(method) },
+        invertThreshold: { value: inverted ? 1.0 : 0.0 }
+      },
+      vertexShader: _shaderVert,
+      fragmentShader: _shaderFragA,
+      transparent: true,
+      side: THREE.FrontSide,
+      depthWrite: false
+    });
+  }
+
+  var mesh = new THREE.Mesh(geo, material);
+  return { mesh: mesh, material: material };
+}
+
+// -- Update shader uniforms for a method when q changes --------------------
+function _updateShaderUniforms(method, thr) {
+  var key = _shaderMethodKey(method);
+  var entry = _shaderCache.get(key);
+  if (!entry) return false;
+  var mat = entry.material;
+
+  if (_shaderTypeB.has(method)) {
+    var perClassThr = _getShaderPerClassThresholds(method, thr);
+    mat.uniforms.perClassThr.value = perClassThr;
+    if (_shaderGradient.has(method)) {
+      mat.uniforms.maxTrainScores.value = _getMaxTrainScoresPerClass(method);
+    }
+  } else {
+    mat.uniforms.threshold.value = _getShaderThreshold(method, thr);
+    if (_shaderGradient.has(method)) {
+      mat.uniforms.maxTrainScore.value = _getMaxTrainScore(method);
+    }
+  }
+  return true;
+}
+
+// Track methods currently being computed to avoid duplicate work
+var _shaderComputing = new Set();
+
 function showMethodAtQ(method, q) {
   if (["cp-proto","cp-fc","mds","mds-s","none"].includes(method)) return;
-  const g = layers[method];
-  const key = methodCacheKey(method, q);
-  // Check cache
-  if (methodTexCache.has(key)) {
-    while (g.children.length) g.remove(g.children[0]);
-    g.add(methodTexCache.get(key));
-    qHideSpinner();
+  var g = layers[method];
+
+  // PROCEDURAL PATH: analytic methods render instantly via GPU shader
+  if (_proceduralMethods.has(method)) {
+    var pKey = _shaderMethodKey(method);
+    if (!_proceduralCache.has(pKey)) {
+      _buildProceduralMesh(method);
+    }
+    var entry = _proceduralCache.get(pKey);
+    if (g.children.indexOf(entry.mesh) < 0) {
+      while (g.children.length) g.remove(g.children[0]);
+      g.add(entry.mesh);
+    }
+    var thr = (Math.abs(q - currentQ) < 0.001) ? cachedThr : allThresholds(q);
+    _updateProceduralUniforms(method, thr);
+    if (typeof qUpdateTrackBar === "function") qUpdateTrackBar();
     return;
   }
-  // Compute on-demand (async to keep animation smooth)
-  if (!cachedThr) return;
-  const thr = (Math.abs(q - currentQ) < 0.001) ? cachedThr : allThresholds(q);
-  const evalFn = getMethodEvalFn(method, thr);
-  if (!evalFn) return;
+
+  // PRECOMPUTED PATH: KNN/KDE use score field textures
+  var shaderKey = _shaderMethodKey(method);
+  if (_shaderCache.has(shaderKey)) {
+    var entry = _shaderCache.get(shaderKey);
+    if (g.children.indexOf(entry.mesh) < 0) {
+      while (g.children.length) g.remove(g.children[0]);
+      g.add(entry.mesh);
+    }
+    var thr = (Math.abs(q - currentQ) < 0.001) ? cachedThr : allThresholds(q);
+    _updateShaderUniforms(method, thr);
+    return;
+  }
+
+  // Score field not yet computed -- show spinner while we wait
   qShowSpinner();
-  const isReduced = method === "knn" || method === "kde";
-  const tw = isReduced ? 1024 : TEX_W;
-  const th = isReduced ? 512 : TEX_H;
-  computeTexPixelsAsync(evalFn, tw, th, function(buf) {
-    const mesh = pixelBufToMesh(buf, tw, th);
-    methodTexCache.set(key, mesh);
+  if (_shaderComputing.has(shaderKey)) return;
+
+  _shaderComputing.add(shaderKey);
+  var isReduced = method === "knn" || method === "kde";
+  var tw = isReduced ? 1024 : TEX_W;
+  var th = isReduced ? 512 : TEX_H;
+
+  computeScoreFieldAsync(method, cachedThr, tw, th, function(scoreData) {
+    _shaderComputing.delete(shaderKey);
+    var built = _buildShaderMesh(method, scoreData, tw, th);
+    _shaderCache.set(shaderKey, {
+      mesh: built.mesh,
+      material: built.material,
+      w: tw, h: th
+    });
+    _updateShaderUniforms(method, cachedThr);
     if (activeMode === method) {
       while (g.children.length) g.remove(g.children[0]);
-      g.add(mesh);
-      qHideSpinner();
+      g.add(built.mesh);
     }
     if (typeof qUpdateTrackBar === "function") qUpdateTrackBar();
   });
@@ -2975,7 +3898,7 @@ function updateDecisionTable(mode) {
   const setLabel = isRandom ? "Random" : (isNear ? "Boundary" : "Low-confidence");
   if (cpModes.has(mode)) {
     const logitsFn = mode === "cp-fc" ? fc.logitsFn : protoLogitsFn;
-    const qhat = conformalCalibrateScore(logitsFn, cpAlpha, cpScoreType);
+    const qhat = _cpQhat(mode, cpScoreType, fcBalanced, cpAlpha);
     const isEmb = cpScoreType === "emb";
     const rows = activeOodPoints.map((x, k) => {
       const probs = softmax(logitsFn(x));
@@ -3106,22 +4029,27 @@ function setActive(mode) {
   const qGroup = document.getElementById("q-slider-group");
   qGroup.style.opacity = isCP ? "0.3" : "1";
   qGroup.style.pointerEvents = isCP ? "none" : "auto";
+  // Clear any stale spinners before the new method potentially shows one
+  qHideSpinner();
+  cpHideSpinner();
   if (isCP) drawConformal(mode);
   // Lazy texture: compute on-demand and cache
   if (!isCP && mode !== "mds" && mode !== "mds-s" && mode !== "none") {
     showMethodAtQ(mode, currentQ);
   }
-  _qCacheDone = false;
+  // Reset play buttons and stop any running animation
   var qpb = document.getElementById("q-play");
   if (qpb) { qpb.style.display = "none"; _qPlaying = false; clearTimeout(_qPlayTimer); qpb.innerHTML = "\u25B6"; }
+  var apb = document.getElementById("alpha-play");
+  if (apb) { apb.style.display = "none"; if (typeof _alphaPlaying !== "undefined") { _alphaPlaying = false; clearTimeout(_alphaPlayTimer); apb.innerHTML = "\u25B6"; } }
   if (typeof qUpdateTrackBar === "function") qUpdateTrackBar();
+  cpUpdateCacheBar();
   if (typeof bgRestart === "function") bgRestart();
   allIds.forEach(id => {
     const btn = document.getElementById("b-" + id);
     if (btn) btn.classList.toggle("active", id === mode);
   });
   updateDecisionTable(mode);
-  cpUpdateCacheBar();
 }
 
 // Remove old cpCacheBarWrap alignment (now inside the table, auto-sized)
@@ -3140,6 +4068,52 @@ document.getElementById("fc-balanced-toggle").addEventListener("change", functio
     if (fcUnbalGroups[key]) fcUnbalGroups[key].visible = !fcBalanced;
   }
   rebuildFCMarkers();
+  // Invalidate procedural cache for FC methods (uniforms depend on FC variant)
+  var fcMethodKeys = ["fc-msp","fc-mls","fc-ebo","fc-ts","fc-odin","fc-vim","fc-cos","fc-vmf","fc-kent"];
+  for (var fmi = 0; fmi < fcMethodKeys.length; fmi++) {
+    var fmk = _shaderMethodKey(fcMethodKeys[fmi]);
+    if (_proceduralCache.has(fmk)) {
+      var fmEntry = _proceduralCache.get(fmk);
+      var fmg = layers[fcMethodKeys[fmi]];
+      if (fmg && fmEntry.mesh && fmg.children.indexOf(fmEntry.mesh) >= 0) {
+        fmg.remove(fmEntry.mesh);
+      }
+      if (fmEntry.material) fmEntry.material.dispose();
+      _proceduralCache.delete(fmk);
+    }
+  }
+  // Invalidate conformal procedural cache for FC-dependent configs
+  var cpScoreTypes = ["aps", "msp"];
+  for (var csi = 0; csi < cpScoreTypes.length; csi++) {
+    // Delete old balanced state entries
+    var cpk = _cpShaderKey("cp-fc", cpScoreTypes[csi], !fcBalanced);
+    if (_cpProceduralCache.has(cpk)) {
+      var cpEntry = _cpProceduralCache.get(cpk);
+      var cpModeKeys = ["cp-proto", "cp-fc"];
+      for (var cmi = 0; cmi < cpModeKeys.length; cmi++) {
+        var cpg = layers[cpModeKeys[cmi]];
+        if (cpg && cpEntry.mesh && cpg.children.indexOf(cpEntry.mesh) >= 0) cpg.remove(cpEntry.mesh);
+      }
+      if (cpEntry.material) cpEntry.material.dispose();
+      _cpProceduralCache.delete(cpk);
+    }
+    // Also delete current balanced state (weights changed)
+    var cpk2 = _cpShaderKey("cp-fc", cpScoreTypes[csi], fcBalanced);
+    if (_cpProceduralCache.has(cpk2)) {
+      var cpEntry2 = _cpProceduralCache.get(cpk2);
+      for (var cmi2 = 0; cmi2 < ["cp-proto","cp-fc"].length; cmi2++) {
+        var cpg2 = layers[["cp-proto","cp-fc"][cmi2]];
+        if (cpg2 && cpEntry2.mesh && cpg2.children.indexOf(cpEntry2.mesh) >= 0) cpg2.remove(cpEntry2.mesh);
+      }
+      if (cpEntry2.material) cpEntry2.material.dispose();
+      _cpProceduralCache.delete(cpk2);
+    }
+  }
+  // Clear calibration score cache for FC configs
+  _cpCalibScores.delete(_cpShaderKey("cp-fc", "aps", !fcBalanced));
+  _cpCalibScores.delete(_cpShaderKey("cp-fc", "msp", !fcBalanced));
+  _cpCalibScores.delete(_cpShaderKey("cp-fc", "aps", fcBalanced));
+  _cpCalibScores.delete(_cpShaderKey("cp-fc", "msp", fcBalanced));
   // Update FC ODIN/ViM thresholds for new FC variant from stored arrays
   fcOdinGamma = _currentFcOdinPerClass().map(xs => quantile(xs, Q)).reduce((a,b) => a+b, 0) / classes.length;
   fcVimThreshold = quantile(_currentFcVimScores(), Q);
@@ -3152,13 +4126,13 @@ document.getElementById("fc-balanced-toggle").addEventListener("change", functio
     var fcMML = allTrainPts.map(p => Math.max(...fc.logitsFn(p))).reduce((a,b) => a+b, 0) / allTrainPts.length;
     fcVimAlphaVal = vimMeanResNorm > 1e-10 ? fcMML / vimMeanResNorm : 0;
   }
-  // Recompute thresholds for new FC variant
+  // Rebuild sorted FC score arrays and recompute thresholds for new FC variant
+  _sortedFC = _buildSortedFCScores();
   cachedThr = allThresholds(currentQ);
   updateQDescs();
   updateFCDescs();
   if (fcModes.has(activeMode)) setActive(activeMode);
   if (cpModes.has(activeMode)) setActive(activeMode);
-  cpEnqueueAll();  // reprioritize with new FC state
 });
 
 document.querySelectorAll('input[name="cp-score"]').forEach(radio => {
@@ -3166,7 +4140,6 @@ document.querySelectorAll('input[name="cp-score"]').forEach(radio => {
     cpScoreType = this.value;
     updateCPDescs();
     if (cpModes.has(activeMode)) setActive(activeMode);
-    cpEnqueueAll();  // reprioritize for new score type
   });
 });
 
@@ -3180,11 +4153,19 @@ function cpApplyAlpha(val) {
   cpAlphaSlider.value = val;
   cpAlphaValInput.value = val.toFixed(2);
   updateCPDescs();
-  if (cpModes.has(activeMode)) setActive(activeMode);
+  // Fast path: procedural conformal — just update the uniform (instant)
+  if (cpModes.has(activeMode)) {
+    _updateConformalProceduralUniforms(activeMode);
+    updateDecisionTable(activeMode);
+  }
 }
 
+// Fire cpApplyAlpha on every slider input event (while dragging).
+// When the shader cache has the score field, this is instant (uniform update only).
 cpAlphaSlider.addEventListener("input", function() {
-  cpAlphaValInput.value = parseFloat(this.value).toFixed(2);
+  var val = parseFloat(this.value);
+  cpAlphaValInput.value = val.toFixed(2);
+  cpApplyAlpha(val);
 });
 cpAlphaSlider.addEventListener("change", function() {
   cpApplyAlpha(parseFloat(this.value));
@@ -3243,8 +4224,16 @@ scene.add(randomOodGroup);
 var randomOodPoints = [];
 
 function generateRandomOodPoints() {
-  // Clear old markers
-  while (randomOodGroup.children.length) randomOodGroup.remove(randomOodGroup.children[0]);
+  // Dispose old GPU resources before clearing
+  for (var di = randomOodGroup.children.length - 1; di >= 0; di--) {
+    var child = randomOodGroup.children[di];
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) {
+      if (child.material.map) child.material.map.dispose();
+      child.material.dispose();
+    }
+    randomOodGroup.remove(child);
+  }
   randomOodPoints.length = 0;
   // Generate 4 random points on S²
   for (var ri = 0; ri < 4; ri++) {
@@ -3370,7 +4359,13 @@ function applyQ(val) {
   desc.textContent = descs[activeMode] || descs.none;
 }
 
-qSlider.addEventListener("input", function() { qValInput.value = parseFloat(this.value).toFixed(2); });
+// Fire applyQ on every slider input event (while dragging), not just change.
+// When the shader cache has the score field, this is instant (uniform update only).
+qSlider.addEventListener("input", function() {
+  var val = parseFloat(this.value);
+  qValInput.value = val.toFixed(2);
+  applyQ(val);
+});
 qSlider.addEventListener("change", function() { applyQ(parseFloat(this.value)); });
 qValInput.addEventListener("keydown", function(e) {
   if (e.key === "Enter") this.blur();
@@ -3435,124 +4430,87 @@ if (loadingEl) {
   setTimeout(() => loadingEl.remove(), 500);
 }
 
-// ── q slider track cache indicator ──
-var _qCacheDone = false;
+// ── q slider track + play button state ──
 function qSetTrackStyle(bg) {
-  let styleEl = document.getElementById("q-track-style");
+  var styleEl = document.getElementById("q-track-style");
   if (!styleEl) {
     styleEl = document.createElement("style");
     styleEl.id = "q-track-style";
     document.head.appendChild(styleEl);
   }
   styleEl.textContent =
-    "#q-slider::-webkit-slider-runnable-track { background: " + bg + " !important; transition: background 0.5s; }" +
-    "#q-slider::-moz-range-track { background: " + bg + " !important; transition: background 0.5s; }";
+    "#q-slider::-webkit-slider-runnable-track { background: " + bg + " !important; }" +
+    "#q-slider::-moz-range-track { background: " + bg + " !important; }";
 }
 
 function qUpdateTrackBar() {
-  if (_qCacheDone) return;
   if (activeMode === "none" || cpModes.has(activeMode) || activeMode === "mds" || activeMode === "mds-s") {
-    qSetTrackStyle("#eceef0");
+    qSetTrackStyle("#dde0e4");
     return;
   }
-  const stops = [];
-  let cached = 0;
-  for (let i = 0; i < 20; i++) {
-    const q = ((i + 1) / 100).toFixed(2);
-    const key = methodCacheKey(activeMode, parseFloat(q));
-    const isCached = methodTexCache.has(key);
-    if (isCached) cached++;
-    const color = isCached ? "rgba(91,108,255,0.5)" : "#eceef0";
-    const pct0 = ((i / 20) * 100).toFixed(1);
-    const pct1 = (((i + 1) / 20) * 100).toFixed(1);
-    stops.push(color + " " + pct0 + "%, " + color + " " + pct1 + "%");
-  }
-  if (cached === 20) {
-    _qCacheDone = true;
-    qSetTrackStyle("#4ade80");
-    setTimeout(() => { qSetTrackStyle("#a0a8b0"); document.getElementById("q-play").style.display = ""; }, 1000);
+  // Procedural methods are always ready
+  if (_proceduralMethods.has(activeMode)) {
+    qSetTrackStyle("#b0b5bc");
+    document.getElementById("q-play").style.display = "";
     return;
   }
-  qSetTrackStyle("linear-gradient(to bottom, " + stops.join(", ") + ")");
+  // KNN/KDE: check precomputed score field cache
+  var shaderKey = _shaderMethodKey(activeMode);
+  if (_shaderCache.has(shaderKey)) {
+    qSetTrackStyle("#b0b5bc");
+    document.getElementById("q-play").style.display = "";
+  } else {
+    qSetTrackStyle("#dde0e4");
+  }
 }
 
 // ── Priority-driven background precomputation ──
-// After each texture finishes, picks the next task based on what's active:
-//   1. Active method's q values (fills the q slider)
-//   2. All methods at current q (so switching methods is instant)
-//   3. All remaining method×q combinations
-//   4. Conformal α sweep (via workers, non-blocking)
-// When the active mode is conformal, conformal gets priority instead.
-const _bgAllMethods = ["msp","mls","ebo","ts","odin","vim","cos","vmf","kent","rmds","knn","kde",
-  "fc-msp","fc-mls","fc-ebo","fc-ts","fc-odin","fc-vim","fc-cos","fc-vmf","fc-kent"];
-const _bgAllQ = [];
-for (let i = 1; i <= 20; i++) _bgAllQ.push(i / 100);
+// Background precompute: only KNN and KDE need score field precomputation.
+// All other methods use procedural GPU shaders (instant, no precompute).
+var _bgPrecomputeMethods = ["knn", "kde"];
 var _bgRunning = false;
-var _bgCpStarted = false;
 
 function _bgPickNext() {
-  const isCP = cpModes.has(activeMode);
-  const isMethodActive = !isCP && activeMode !== "none" && activeMode !== "mds" && activeMode !== "mds-s";
-
-  // If conformal is active, prioritize conformal workers (they run independently)
-  if (isCP && !_bgCpStarted) {
-    _bgCpStarted = true;
-    cpEnqueueAll();
-  }
-
-  // Priority 1: active method's q values
-  if (isMethodActive) {
-    for (const q of _bgAllQ) {
-      const key = methodCacheKey(activeMode, q);
-      if (!methodTexCache.has(key)) return { method: activeMode, q };
+  for (var i = 0; i < _bgPrecomputeMethods.length; i++) {
+    var m = _bgPrecomputeMethods[i];
+    var mKey = _shaderMethodKey(m);
+    if (!_shaderCache.has(mKey) && !_shaderComputing.has(mKey)) {
+      return m;
     }
   }
-
-  // Priority 2: all methods at current q
-  for (const m of _bgAllMethods) {
-    const key = methodCacheKey(m, currentQ);
-    if (!methodTexCache.has(key)) return { method: m, q: currentQ };
-  }
-
-  // Priority 3: all methods at default q=0.05
-  for (const m of _bgAllMethods) {
-    const key = methodCacheKey(m, 0.05);
-    if (!methodTexCache.has(key)) return { method: m, q: 0.05 };
-  }
-
-  // Priority 4: fill remaining method×q grid
-  for (const q of _bgAllQ) {
-    for (const m of _bgAllMethods) {
-      const key = methodCacheKey(m, q);
-      if (!methodTexCache.has(key)) return { method: m, q };
-    }
-  }
-
-  // All done — start conformal if not already
-  if (!_bgCpStarted) { _bgCpStarted = true; cpEnqueueAll(); }
   return null;
 }
 
 function _bgNext() {
-  const task = _bgPickNext();
-  if (!task) { _bgRunning = false; qUpdateTrackBar(); return; }
+  var method = _bgPickNext();
+  if (!method) { _bgRunning = false; qUpdateTrackBar(); return; }
   _bgRunning = true;
-  const { method, q } = task;
-  const key = methodCacheKey(method, q);
-  if (methodTexCache.has(key)) { _bgNext(); return; }  // race check
-  const thr = (Math.abs(q - currentQ) < 0.001) ? cachedThr : allThresholds(q);
-  const evalFn = getMethodEvalFn(method, thr);
-  if (!evalFn) { _bgNext(); return; }
-  const isReduced = method === "knn" || method === "kde";
-  const tw = isReduced ? 1024 : TEX_W, th = isReduced ? 512 : TEX_H;
-  computeTexPixelsAsync(evalFn, tw, th, function(buf) {
-    methodTexCache.set(key, pixelBufToMesh(buf, tw, th));
+  var shaderKey = _shaderMethodKey(method);
+  if (_shaderCache.has(shaderKey) || _shaderComputing.has(shaderKey)) {
+    setTimeout(_bgNext, 10);
+    return;
+  }
+  _shaderComputing.add(shaderKey);
+  var tw = 1024, th = 512; // KNN/KDE use reduced resolution
+  computeScoreFieldAsync(method, cachedThr, tw, th, function(scoreData) {
+    _shaderComputing.delete(shaderKey);
+    var built = _buildShaderMesh(method, scoreData, tw, th);
+    _shaderCache.set(shaderKey, {
+      mesh: built.mesh,
+      material: built.material,
+      w: tw, h: th
+    });
+    _updateShaderUniforms(method, cachedThr);
+    if (activeMode === method) {
+      var g = layers[method];
+      while (g.children.length) g.remove(g.children[0]);
+      g.add(built.mesh);
+    }
     qUpdateTrackBar();
     _bgNext();
   });
 }
 
-// Kick off on method change (restart priorities)
 function bgRestart() { if (!_bgRunning) setTimeout(_bgNext, 50); }
 
 // Start after scene renders
