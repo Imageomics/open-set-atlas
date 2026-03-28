@@ -112,11 +112,12 @@ canvas { display: block; }
               style="width:32px; border:1px solid transparent; border-radius:3px; padding:1px 2px; text-align:center;
                      background:transparent; font-size:11px; outline:none; transition:border-color 0.2s;"
               onfocus="this.style.borderColor='#5b6cff'" onblur="this.style.borderColor='transparent'">
+            <button id="q-play" style="font-size:10px; padding:1px 4px; border-radius:4px; cursor:pointer; border:0.5px solid #c7cbd1; background:transparent; color:#6b7280; line-height:1; display:none;">&#9654;</button>
           </div>
         </td>
       </tr>
       <tr>
-        <td style="font-weight:600; font-size:11px; white-space:nowrap;">Learned&nbsp;FC</td>
+        <td style="font-weight:600; font-size:11px; white-space:nowrap;" title="Fully-connected layer: learned weight vectors W and biases b">Learned&nbsp;FC</td>
         <td><button id="b-fc-msp">&#x2022;</button></td>
         <td><button id="b-fc-mls">&#x2022;</button></td>
         <td><button id="b-fc-ebo">&#x2022;</button></td>
@@ -146,6 +147,7 @@ canvas { display: block; }
         style="width:32px; border:1px solid transparent; border-radius:3px; padding:1px 2px; text-align:center;
                background:transparent; font-size:12px; outline:none; transition:border-color 0.2s;"
         onfocus="this.style.borderColor='#5b6cff'" onblur="this.style.borderColor='transparent'">
+      <button id="alpha-play" style="font-size:10px; padding:1px 4px; border-radius:4px; cursor:pointer; border:0.5px solid #c7cbd1; background:transparent; color:#6b7280; line-height:1; margin-left:4px; display:none;">&#9654;</button>
     </span>
   </div>
   <div class="controls">
@@ -1853,6 +1855,8 @@ function cpDispatchNext(worker) {
 
 function cpEnqueueAll() {
   _cpCacheDone = false;
+  var apb = document.getElementById("alpha-play");
+  if (apb) { apb.style.display = "none"; if (typeof _alphaPlaying !== "undefined") { _alphaPlaying = false; clearTimeout(_alphaPlayTimer); apb.innerHTML = "\u25B6"; } }
   cpTaskQueue = [];
   const alphas = [];
   for (let a = 1; a <= 30; a++) alphas.push(a / 100);
@@ -1927,10 +1931,9 @@ function cpUpdateCacheBar() {
     stops.push(color + " " + pct0 + "%, " + color + " " + pct1 + "%");
   }
   if (cached === 30) {
-    // All done: flash green, then settle to solid gray
     _cpCacheDone = true;
     cpSetTrackStyle("#4ade80");
-    setTimeout(() => cpSetTrackStyle("#a0a8b0"), 1000);
+    setTimeout(() => { cpSetTrackStyle("#a0a8b0"); document.getElementById("alpha-play").style.display = ""; }, 1000);
     return;
   }
   cpSetTrackStyle("linear-gradient(to right, " + stops.join(", ") + ")");
@@ -3086,6 +3089,8 @@ function setActive(mode) {
     showMethodAtQ(mode, currentQ);
   }
   _qCacheDone = false;
+  var qpb = document.getElementById("q-play");
+  if (qpb) { qpb.style.display = "none"; _qPlaying = false; clearTimeout(_qPlayTimer); qpb.innerHTML = "\u25B6"; }
   if (typeof qUpdateTrackBar === "function") qUpdateTrackBar();
   if (typeof bgRestart === "function") bgRestart();
   allIds.forEach(id => {
@@ -3306,6 +3311,50 @@ qValInput.addEventListener("blur", function() {
   applyQ(v);
 });
 
+// ── Play buttons for q and α ──
+var _qPlaying = false, _qPlayTimer = 0;
+var _alphaPlaying = false, _alphaPlayTimer = 0;
+var qPlayBtn = document.getElementById("q-play");
+var alphaPlayBtn = document.getElementById("alpha-play");
+
+qPlayBtn.addEventListener("click", function() {
+  if (_qPlaying) {
+    _qPlaying = false;
+    clearTimeout(_qPlayTimer);
+    qPlayBtn.innerHTML = "\u25B6";
+    return;
+  }
+  _qPlaying = true;
+  qPlayBtn.innerHTML = "\u23F8";
+  function step() {
+    if (!_qPlaying) return;
+    var next = Math.round((currentQ + 0.01) * 100) / 100;
+    if (next > 0.20) next = 0.01;
+    applyQ(next);
+    _qPlayTimer = setTimeout(step, 1500);
+  }
+  step();
+});
+
+alphaPlayBtn.addEventListener("click", function() {
+  if (_alphaPlaying) {
+    _alphaPlaying = false;
+    clearTimeout(_alphaPlayTimer);
+    alphaPlayBtn.innerHTML = "\u25B6";
+    return;
+  }
+  _alphaPlaying = true;
+  alphaPlayBtn.innerHTML = "\u23F8";
+  function step() {
+    if (!_alphaPlaying) return;
+    var next = Math.round((cpAlpha + 0.01) * 100) / 100;
+    if (next > 0.30) next = 0.01;
+    cpApplyAlpha(next);
+    _alphaPlayTimer = setTimeout(step, 1500);
+  }
+  step();
+});
+
 setActive("none");
 
 // Fade out loading placeholder — scene is ready (textures load lazily)
@@ -3350,7 +3399,7 @@ function qUpdateTrackBar() {
   if (cached === 20) {
     _qCacheDone = true;
     qSetTrackStyle("#4ade80");
-    setTimeout(() => qSetTrackStyle("#a0a8b0"), 1000);
+    setTimeout(() => { qSetTrackStyle("#a0a8b0"); document.getElementById("q-play").style.display = ""; }, 1000);
     return;
   }
   qSetTrackStyle("linear-gradient(to bottom, " + stops.join(", ") + ")");
