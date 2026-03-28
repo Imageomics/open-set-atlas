@@ -1172,7 +1172,7 @@ if (!PRE) {
           const t = maxS > thrVal ? (bestS - thrVal) / (maxS - thrVal) : 1;
           const [r, g, b] = hexToRGB(classes[bestCI].color);
           pixels[idx] = r; pixels[idx+1] = g; pixels[idx+2] = b;
-          pixels[idx+3] = Math.round((0.10 + 0.50 * Math.min(1, t)) * 255);
+          pixels[idx+3] = Math.round((0.01 + 0.74 * Math.min(1, t)) * 255);
         }
       }
     }
@@ -1210,7 +1210,7 @@ if (!PRE) {
           const t = maxS > thrVal ? (bestS - thrVal) / (maxS - thrVal) : 1;
           const [r, g, b] = hexToRGB(classes[bestCI].color);
           pixels[idx] = r; pixels[idx+1] = g; pixels[idx+2] = b;
-          pixels[idx+3] = Math.round((0.10 + 0.50 * Math.min(1, t)) * 255);
+          pixels[idx+3] = Math.round((0.01 + 0.74 * Math.min(1, t)) * 255);
         }
       }
     }
@@ -1517,7 +1517,7 @@ function makeFCTextures(variant, parentGroups) {
     const maxS = Math.max(...scores);
     const thrVal = variant.fcVmBands[bestCI][0];
     const t = maxS > thrVal ? (bestS - thrVal) / (maxS - thrVal) : 1;
-    return { color: classes[bestCI].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
+    return { color: classes[bestCI].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
   }
   function evalKent(p) {
     let bestCI = -1, bestRatio = -Infinity, bestS = 0;
@@ -1534,7 +1534,7 @@ function makeFCTextures(variant, parentGroups) {
     const maxS = Math.max(...scores);
     const thrVal = variant.fcKents[bestCI].bands[0];
     const t = maxS > thrVal ? (bestS - thrVal) / (maxS - thrVal) : 1;
-    return { color: classes[bestCI].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
+    return { color: classes[bestCI].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
   }
   const evals = { "fc-msp": evalMSP, "fc-mls": evalMLS, "fc-ebo": evalEBO, "fc-ts": evalTS, "fc-cos": evalCos, "fc-vmf": evalVmf, "fc-kent": evalKent };
   for (const key of ["fc-msp", "fc-mls", "fc-ebo", "fc-ts", "fc-cos", "fc-vmf", "fc-kent"]) {
@@ -2391,7 +2391,7 @@ function getMethodEvalFn(method, thr) {
       const maxS = Math.max(...classes[best2].vmScores);
       const thrVal = thr.vmfBands[best2][0];
       const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
-      return { color: classes[best2].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
+      return { color: classes[best2].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
     };
     case "kent": return (p) => {
       let best2 = -1, bestRatio2 = -Infinity, bestS2 = 0;
@@ -2407,7 +2407,7 @@ function getMethodEvalFn(method, thr) {
       const maxS = Math.max(...classes[best2].kentScores);
       const thrVal = thr.kentBands[best2][0];
       const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
-      return { color: classes[best2].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
+      return { color: classes[best2].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
     };
     case "knn": return (p) => {
       const r = knnResult(p);
@@ -2421,7 +2421,11 @@ function getMethodEvalFn(method, thr) {
     };
     case "kde": return (p) => {
       const r = kdeScore(p);
-      if (r.density >= thr.kdeThr) return { color: classes[r.bestClass].color, opacity: 0.55 };
+      if (r.density >= thr.kdeThr) {
+        const maxD = Math.max(...trainKDEscores);
+        const t = maxD > thr.kdeThr ? (r.density - thr.kdeThr) / (maxD - thr.kdeThr) : 1;
+        return { color: classes[r.bestClass].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
+      }
       return null;
     };
     case "fc-msp": return (p) => {
@@ -2479,7 +2483,7 @@ function getMethodEvalFn(method, thr) {
       const maxS = Math.max(...fcVmScores);
       const thrVal = thr.fcVmfBands[best2][0];
       const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
-      return { color: classes[best2].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
+      return { color: classes[best2].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
     };
     case "fc-kent": return (p) => {
       let best2 = -1, bestRatio2 = -Infinity, bestS2 = 0;
@@ -2496,7 +2500,7 @@ function getMethodEvalFn(method, thr) {
       const maxS = Math.max(...fcKScores);
       const thrVal = thr.fcKentBands[best2][0];
       const t = maxS > thrVal ? (bestS2 - thrVal) / (maxS - thrVal) : 1;
-      return { color: classes[best2].color, opacity: 0.10 + 0.50 * Math.min(1, t) };
+      return { color: classes[best2].color, opacity: 0.01 + 0.74 * Math.min(1, t) };
     };
     default: return null;
   }
