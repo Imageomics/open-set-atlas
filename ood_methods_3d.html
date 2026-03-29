@@ -5,11 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>OOD Methods on S² — 3D Interactive</title>
 <style>
-body { font-family: Inter, system-ui, sans-serif; margin: 0; padding: 16px; background: #fff; color: #111; }
-.wrap { max-width: 1120px; margin: 0 auto; }
+body { font-family: Inter, system-ui, sans-serif; margin: 0; padding: 16px 64px; background: #fff; color: #111; }
+.wrap { max-width: 1280px; margin: 0 auto; }
 .main-row { display: flex; gap: 16px; align-items: flex-start; }
 .viz-col { flex: 1; min-width: 0; }
-.decisions-col { flex: 0 0 380px; max-height: 520px; overflow-y: auto; }
+.decisions-col { flex: 0 0 380px; }
+.decisions-col #ood-decisions { max-height: 490px; overflow-y: auto; }
+.legend-col { flex: 0 0 auto; max-height: 520px; overflow-y: auto; }
 .controls { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
 button { font-size: 12px; padding: 5px 12px; border-radius: 8px; cursor: pointer; border: 0.5px solid #c7cbd1; background: transparent; color: #111; }
 button.active { border: 2px solid #5b6cff; background: rgba(91,108,255,.08); color: #3444d4; }
@@ -134,78 +136,78 @@ canvas { display: block; }
       </tr>
     </tbody>
   </table>
-  <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:10px; padding:6px 8px; border:1px solid #e5e7eb; border-radius:8px; font-size:12px;">
-    <span style="font-weight:600; font-size:11px; color:#6b7280; white-space:nowrap;">Conformal</span>
-    <button id="b-cp-proto">Proto &#x2022;</button>
-    <button id="b-cp-fc">FC &#x2022;</button>
-    <span id="cp-settings" style="display:inline-flex; align-items:center; gap:6px; flex-wrap:wrap; transition:opacity 0.3s; opacity:0.3; pointer-events:none;">
-      <span style="margin-left:4px; color:#9ca3af;">Score:</span>
-      <label><input type="radio" name="cp-score" value="aps" checked> APS</label>
-      <label><input type="radio" name="cp-score" value="msp"> 1&#8722;MSP</label>
-      <label><input type="radio" name="cp-score" value="emb"> Emb</label>
-      <span style="margin-left:6px;" id="cp-alpha-label" class="formula" title="Conformal miscoverage level. Visual changes are discrete &#8212; this is a property of finite-sample conformal calibration: coverage is bought in discrete chunks determined by the calibration set size, not by the score geometry.">&alpha;:</span>
-      <input type="range" id="cp-alpha" min="0.01" max="0.30" step="0.001" value="0.10" style="width:60px;">
-      <input type="text" id="cp-alpha-val" class="formula" value="0.10"
-        style="width:32px; border:1px solid transparent; border-radius:3px; padding:1px 2px; text-align:center;
-               background:transparent; font-size:12px; outline:none; transition:border-color 0.2s;"
-        onfocus="this.style.borderColor='#5b6cff'" onblur="this.style.borderColor='transparent'">
-      <button id="alpha-play" style="font-size:10px; padding:1px 4px; border-radius:4px; cursor:pointer; border:0.5px solid #c7cbd1; background:transparent; color:#6b7280; line-height:1; margin-left:4px; display:none;">&#9654;</button>
-    </span>
-  </div>
-  <div class="controls">
-    <span style="font-size:11px; color:#6b7280; margin-right:2px;">Distance-based:</span>
-    <button id="b-none" class="active">Data only</button>
-    <button id="b-mds">Mahal. (per-class)</button>
-    <button id="b-mds-s">Mahal. (shared)</button>
-    <button id="b-rmds">RMDS</button>
-    <button id="b-knn">KNN</button>
-    <button id="b-kde">KDE</button>
+  <div style="display:flex; gap:12px; margin-bottom:10px; font-size:12px;">
+    <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; padding:6px 8px; border:1px solid #e5e7eb; border-radius:8px;">
+      <span style="font-weight:600; font-size:11px; color:#6b7280; white-space:nowrap;">Distance-based</span>
+      <button id="b-none" class="active">Data only</button>
+      <button id="b-mds">Mahal. (per-class)</button>
+      <button id="b-mds-s">Mahal. (shared)</button>
+      <button id="b-rmds">RMDS</button>
+      <button id="b-knn">KNN</button>
+      <button id="b-kde">KDE</button>
+    </div>
+    <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap; padding:6px 8px; border:1px solid #e5e7eb; border-radius:8px;">
+      <span style="font-weight:600; font-size:11px; color:#6b7280; white-space:nowrap;">Conformal</span>
+      <button id="b-cp-proto">Proto &#x2022;</button>
+      <button id="b-cp-fc">FC &#x2022;</button>
+      <span id="cp-settings" style="display:inline-flex; align-items:center; gap:6px; flex-wrap:wrap; transition:opacity 0.3s; opacity:0.3; pointer-events:none;">
+        <span style="margin-left:4px; color:#9ca3af;">Score:</span>
+        <label><input type="radio" name="cp-score" value="aps" checked> APS</label>
+        <label><input type="radio" name="cp-score" value="msp"> 1&#8722;MSP</label>
+        <label><input type="radio" name="cp-score" value="emb"> Emb</label>
+        <span style="margin-left:6px;" id="cp-alpha-label" class="formula" title="Conformal miscoverage level. Visual changes are discrete &#8212; this is a property of finite-sample conformal calibration: coverage is bought in discrete chunks determined by the calibration set size, not by the score geometry.">&alpha;:</span>
+        <input type="range" id="cp-alpha" min="0.01" max="0.30" step="0.001" value="0.10" style="width:60px;">
+        <input type="text" id="cp-alpha-val" class="formula" value="0.10"
+          style="width:32px; border:1px solid transparent; border-radius:3px; padding:1px 2px; text-align:center;
+                 background:transparent; font-size:12px; outline:none; transition:border-color 0.2s;"
+          onfocus="this.style.borderColor='#5b6cff'" onblur="this.style.borderColor='transparent'">
+        <button id="alpha-play" style="font-size:10px; padding:1px 4px; border-radius:4px; cursor:pointer; border:0.5px solid #c7cbd1; background:transparent; color:#6b7280; line-height:1; margin-left:4px; display:none;">&#9654;</button>
+      </span>
+    </div>
   </div>
   <div id="desc" class="desc"></div>
-  <div class="ood-toggle-row">
-    <span style="font-size:11px; color:#6b7280;">Test points:</span>
-    <label><input type="radio" name="ood-set" value="far" checked> Low-confidence</label>
-    <label><input type="radio" name="ood-set" value="near"> Boundary</label>
-    <button id="ood-random" style="font-size:11px; padding:2px 8px; border-radius:4px; cursor:pointer; border:0.5px solid #c7cbd1; background:transparent; color:#6b7280; margin-left:4px;">Random &#x21bb;</button>
-  </div>
   <div class="main-row">
-    <div class="viz-col">
-      <div id="canvas-wrap">
-        <div id="loading-placeholder"><span>Loading visualization...</span></div>
-      </div>
+    <div class="legend-col">
+      <table id="class-legend" style="border-collapse:collapse; font-size:11px; color:#4b5563;">
+        <thead>
+          <tr style="color:#9ca3af; font-size:10px;">
+            <th style="padding:2px 6px; text-align:left;">Class</th>
+            <th style="padding:2px 6px; text-align:right;">n</th>
+            <th style="padding:2px 6px; text-align:right; font-family:ui-monospace,monospace;">&kappa;</th>
+            <th style="padding:2px 6px; text-align:left;"></th>
+          </tr>
+        </thead>
+        <tbody id="class-legend-body"></tbody>
+        <tfoot>
+          <tr style="border-top:1px solid #e5e7eb;">
+            <td style="padding:3px 6px;"><span class="chip" style="background:#E24B4A; border-radius:0;"></span>OOD</td>
+            <td colspan="3" style="padding:3px 6px; color:#9ca3af;" id="ood-legend-desc">unknown / low-MSP shell points</td>
+          </tr>
+        </tfoot>
+      </table>
     </div>
-    <div class="decisions-col" id="ood-decisions"></div>
-  </div>
-  <div style="display:flex; gap:16px; align-items:flex-start; margin-top:8px;">
-    <table id="class-legend" style="border-collapse:collapse; font-size:11px; color:#4b5563;">
-      <thead>
-        <tr style="color:#9ca3af; font-size:10px;">
-          <th style="padding:2px 6px; text-align:left;">Class</th>
-          <th style="padding:2px 6px; text-align:right;">n</th>
-          <th style="padding:2px 6px; text-align:right; font-family:ui-monospace,monospace;">&kappa;</th>
-          <th style="padding:2px 6px; text-align:left;"></th>
-        </tr>
-      </thead>
-      <tbody id="class-legend-body"></tbody>
-      <tfoot>
-        <tr style="border-top:1px solid #e5e7eb;">
-          <td style="padding:3px 6px;"><span class="chip" style="background:#E24B4A; border-radius:0;"></span>OOD</td>
-          <td colspan="3" style="padding:3px 6px; color:#9ca3af;" id="ood-legend-desc">unknown / low-MSP shell points</td>
-        </tr>
-      </tfoot>
-    </table>
-    <div style="display:flex; flex-direction:column; gap:6px; font-size:11px; color:#6b7280; padding-top:2px;">
-      <div style="display:flex; align-items:center; gap:6px;">
+    <div class="viz-col">
+      <div style="display:flex; align-items:center; justify-content:center; gap:8px; margin-bottom:6px; font-size:11px; color:#6b7280;">
         <span>Rotation:</span>
         <input type="range" id="rot-speed" min="0" max="100" value="100" style="width:70px; height:4px; accent-color:#5b6cff;">
         <input type="text" id="rot-speed-val" class="formula" value="1.0"
           style="width:28px; border:1px solid transparent; border-radius:3px; padding:1px 2px; text-align:center;
                  background:transparent; font-size:11px; outline:none; transition:border-color 0.2s;"
           onfocus="this.style.borderColor='#5b6cff'" onblur="this.style.borderColor='transparent'">&times;
-      </div>
-      <div>
         <button id="zoom-reset" style="font-size:11px; padding:2px 8px; border-radius:4px; cursor:pointer; border:0.5px solid #c7cbd1; background:transparent; color:#6b7280;">Reset zoom</button>
       </div>
+      <div id="canvas-wrap">
+        <div id="loading-placeholder"><span>Loading visualization...</span></div>
+      </div>
+    </div>
+    <div class="decisions-col">
+      <div class="ood-toggle-row" style="margin-bottom:6px;">
+        <span style="font-size:11px; color:#6b7280;">Test points:</span>
+        <label><input type="radio" name="ood-set" value="far" checked> Low-confidence</label>
+        <label><input type="radio" name="ood-set" value="near"> Boundary</label>
+        <button id="ood-random" style="font-size:11px; padding:2px 8px; border-radius:4px; cursor:pointer; border:0.5px solid #c7cbd1; background:transparent; color:#6b7280; margin-left:4px;">Random &#x21bb;</button>
+      </div>
+      <div id="ood-decisions"></div>
     </div>
   </div>
   <div class="note">
