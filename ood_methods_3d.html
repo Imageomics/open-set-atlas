@@ -82,7 +82,7 @@ canvas { display: block; }
 <div class="wrap">
   <table class="classifier-grid">
     <thead>
-      <tr><th></th><th>MSP</th><th>MLS</th><th>EBO</th><th>TmpSc</th><th>ODIN</th><th>ViM</th><th>Cos</th><th>vMF</th><th>Kent</th><th>Weights</th><th style="text-align:center; font-size:10px;" id="q-header-label">q</th></tr>
+      <tr><th></th><th>MSP</th><th>MLS</th><th>EBO</th><th>TmpSc</th><th>ODIN</th><th>ViM</th><th>Cos</th><th>vMF</th><th>Kent</th><th>Weights</th><th style="text-align:center; font-size:10px;" id="q-header-label" title="Threshold quantile. As q sweeps, visual changes may appear uneven &#8212; this reflects the non-uniform distribution of scores on the sphere surface. Large jumps mean many points share a narrow score band; flat stretches mean few points have scores in that range.">q</th></tr>
     </thead>
     <tbody>
       <tr>
@@ -99,7 +99,7 @@ canvas { display: block; }
         <td class="row-label">Unit-normalized class means (&#956;&#770;&#7522;), no biases.</td>
         <td rowspan="2" id="q-slider-group" style="vertical-align:middle; text-align:center; padding:4px 6px; transition:opacity 0.3s;">
           <div style="display:flex; flex-direction:column; align-items:center; gap:2px;">
-            <input type="range" id="q-slider" min="0.01" max="0.20" step="0.01" value="0.05" list="q-ticks"
+            <input type="range" id="q-slider" min="0.01" max="0.30" step="0.001" value="0.05" list="q-ticks"
               orient="vertical" style="height:60px; writing-mode:vertical-lr; direction:rtl;">
             <datalist id="q-ticks">
               <option value="0.01"></option>
@@ -107,9 +107,11 @@ canvas { display: block; }
               <option value="0.10"></option>
               <option value="0.15"></option>
               <option value="0.20"></option>
+              <option value="0.25"></option>
+              <option value="0.30"></option>
             </datalist>
-            <input type="text" id="q-val" class="formula" value="0.05"
-              style="width:32px; border:1px solid transparent; border-radius:3px; padding:1px 2px; text-align:center;
+            <input type="text" id="q-val" class="formula" value="0.050"
+              style="width:40px; border:1px solid transparent; border-radius:3px; padding:1px 2px; text-align:center;
                      background:transparent; font-size:11px; outline:none; transition:border-color 0.2s;"
               onfocus="this.style.borderColor='#5b6cff'" onblur="this.style.borderColor='transparent'">
             <button id="q-play" style="font-size:10px; padding:1px 4px; border-radius:4px; cursor:pointer; border:0.5px solid #c7cbd1; background:transparent; color:#6b7280; line-height:1; display:none;">&#9654;</button>
@@ -141,8 +143,8 @@ canvas { display: block; }
       <label><input type="radio" name="cp-score" value="aps" checked> APS</label>
       <label><input type="radio" name="cp-score" value="msp"> 1&#8722;MSP</label>
       <label><input type="radio" name="cp-score" value="emb"> Emb</label>
-      <span style="margin-left:6px;" id="cp-alpha-label" class="formula">&alpha;:</span>
-      <input type="range" id="cp-alpha" min="0.01" max="0.30" step="0.01" value="0.10" style="width:60px;">
+      <span style="margin-left:6px;" id="cp-alpha-label" class="formula" title="Conformal miscoverage level. Visual changes are discrete &#8212; this is a property of finite-sample conformal calibration: coverage is bought in discrete chunks determined by the calibration set size, not by the score geometry.">&alpha;:</span>
+      <input type="range" id="cp-alpha" min="0.01" max="0.30" step="0.001" value="0.10" style="width:60px;">
       <input type="text" id="cp-alpha-val" class="formula" value="0.10"
         style="width:32px; border:1px solid transparent; border-radius:3px; padding:1px 2px; text-align:center;
                background:transparent; font-size:12px; outline:none; transition:border-color 0.2s;"
@@ -1877,7 +1879,7 @@ const descs = {
 var cachedThr = null;  // declared early; assigned after allThresholds is defined
 
 function qNoteStr() {
-  return " \u2014 Threshold quantile q = " + currentQ.toFixed(2) +
+  return " \u2014 Threshold quantile q = " + currentQ.toFixed(3) +
     ": the " + (currentQ * 100).toFixed(0) + "th percentile of training scores sets the accept/reject boundary. " +
     "Adjust q with the slider in the table to contract (higher q) or expand (lower q) the accepted region.";
 }
@@ -1939,9 +1941,9 @@ function updateCPDescs() {
     ? "Non-conformity score = 1 \u2212 cos(x, \u03BC\u0302_y). Include class k if cos(x, \u03BC\u0302_k) \u2265 1 \u2212 q\u0302. " +
       "Operates directly in embedding space \u2014 no softmax or logits needed. "
     : "Non-conformity score from softmax probabilities. ";
-  const alphaNote = " \u2014 \u03B1 = " + cpAlpha.toFixed(2) +
+  const alphaNote = " \u2014 \u03B1 = " + cpAlpha.toFixed(3) +
     " (miscoverage rate): the prediction set contains the true class with probability \u2265 " +
-    (1-cpAlpha).toFixed(2) + ". Same role as in hypothesis testing, but the guarantee is distribution-free. " +
+    (1-cpAlpha).toFixed(3) + ". Same role as in hypothesis testing, but the guarantee is distribution-free. " +
     "Lower \u03B1 = larger sets, stronger guarantee. Higher \u03B1 = smaller sets; if empty, the point is OOD.";
   descs["cp-proto"] =
     "Conformal prediction (" + (isEmb ? "embedding space" : "prototype logits") + ", " + scoreStr + "): " +
@@ -2143,7 +2145,7 @@ function qHideSpinner() {
 // Type B (per-class threshold + ratio overlap): Cos, vMF, Kent, fc-cos, fc-vmf, fc-kent
 var _shaderTypeB = new Set(["cos","vmf","kent","fc-cos","fc-vmf","fc-kent"]);
 // Gradient methods (opacity varies with score)
-var _shaderGradient = new Set(["vmf","kent","kde","fc-vmf","fc-kent"]);
+var _shaderGradient = new Set(["vmf","kent","kde","knn","fc-vmf","fc-kent"]);
 
 // -- Shared vertex shader --------------------------------------------------
 var _shaderVert = [
@@ -2190,6 +2192,7 @@ var _shaderFragLogit = [
   "uniform vec3 classW[5];",
   "uniform float classB[5];",
   "uniform float threshold;",
+  "uniform float maxTrainScore;",
   "uniform vec3 classColors[5];",
   "uniform int scoreMode;",
   "varying vec2 vUv;",
@@ -2201,7 +2204,6 @@ var _shaderFragLogit = [
   "  float l2 = dot(classW[2], x) + classB[2];",
   "  float l3 = dot(classW[3], x) + classB[3];",
   "  float l4 = dot(classW[4], x) + classB[4];",
-  // Find max logit and argmax
   "  float maxL = l0; int bestCI = 0;",
   "  if (l1 > maxL) { maxL = l1; bestCI = 1; }",
   "  if (l2 > maxL) { maxL = l2; bestCI = 2; }",
@@ -2209,13 +2211,10 @@ var _shaderFragLogit = [
   "  if (l4 > maxL) { maxL = l4; bestCI = 4; }",
   "  float score = 0.0;",
   "  if (scoreMode == 1) {",
-  // MLS: score = max logit
   "    score = maxL;",
   "  } else if (scoreMode == 2) {",
-  // EBO: score = logsumexp
   "    score = maxL + log(exp(l0 - maxL) + exp(l1 - maxL) + exp(l2 - maxL) + exp(l3 - maxL) + exp(l4 - maxL));",
   "  } else {",
-  // MSP / TS: score = max softmax prob
   "    float e0 = exp(l0 - maxL); float e1 = exp(l1 - maxL); float e2 = exp(l2 - maxL);",
   "    float e3 = exp(l3 - maxL); float e4 = exp(l4 - maxL);",
   "    float sumE = e0 + e1 + e2 + e3 + e4;",
@@ -2228,7 +2227,9 @@ var _shaderFragLogit = [
   "  }",
   "  if (score >= threshold) {",
   _glslPickColor,
-  "    gl_FragColor = vec4(color, 0.55);",
+  "    float t = (maxTrainScore > threshold + 0.0001) ? (score - threshold) / (maxTrainScore - threshold) : 1.0;",
+  "    float alpha = 0.01 + 0.74 * clamp(t, 0.0, 1.0);",
+  "    gl_FragColor = vec4(color, alpha);",
   "  } else {",
   "    gl_FragColor = vec4(0.0);",
   "  }",
@@ -2361,6 +2362,7 @@ var _shaderFragODIN = [
   "uniform float odinT;",
   "uniform float odinEps;",
   "uniform float threshold;",
+  "uniform float maxTrainScore;",
   "uniform vec3 classColors[5];",
   "varying vec2 vUv;",
   _glslDirFromUV,
@@ -2426,7 +2428,9 @@ var _shaderFragODIN = [
   "  if (e4p > bestE) { bestE = e4p; bestCI = 4; }",
   "  if (score >= threshold) {",
   _glslPickColor,
-  "    gl_FragColor = vec4(color, 0.55);",
+  "    float t = (maxTrainScore > threshold + 0.0001) ? (score - threshold) / (maxTrainScore - threshold) : 1.0;",
+  "    float alpha = 0.01 + 0.74 * clamp(t, 0.0, 1.0);",
+  "    gl_FragColor = vec4(color, alpha);",
   "  } else {",
   "    gl_FragColor = vec4(0.0);",
   "  }",
@@ -2443,6 +2447,7 @@ var _shaderFragViM = [
   "uniform vec3 muAll;",
   "uniform float vimAlphaU;",  // named vimAlphaU to avoid GLSL keyword clash
   "uniform float threshold;",
+  "uniform float maxTrainScore;",
   "uniform vec3 classColors[5];",
   "varying vec2 vUv;",
   _glslDirFromUV,
@@ -2473,7 +2478,9 @@ var _shaderFragViM = [
   "  if (l4 > bestL) { bestL = l4; bestCI = 4; }",
   "  if (score >= threshold) {",
   _glslPickColor,
-  "    gl_FragColor = vec4(color, 0.55);",
+  "    float t = (maxTrainScore > threshold + 0.0001) ? (score - threshold) / (maxTrainScore - threshold) : 1.0;",
+  "    float alpha = 0.01 + 0.74 * clamp(t, 0.0, 1.0);",
+  "    gl_FragColor = vec4(color, alpha);",
   "  } else {",
   "    gl_FragColor = vec4(0.0);",
   "  }",
@@ -2487,6 +2494,7 @@ var _shaderFragRMDS = [
   "uniform vec3 classMeans[5];",
   "uniform vec3 globalMean;",
   "uniform float threshold;",
+  "uniform float minTrainScore;",
   "uniform vec3 classColors[5];",
   "varying vec2 vUv;",
   _glslDirFromUV,
@@ -2512,7 +2520,9 @@ var _shaderFragRMDS = [
   // Inverted threshold: lower score = more in-distribution
   "  if (score <= threshold) {",
   _glslPickColor,
-  "    gl_FragColor = vec4(color, 0.55);",
+  "    float t = (abs(threshold - minTrainScore) > 0.0001) ? (threshold - score) / (threshold - minTrainScore) : 1.0;",
+  "    float alpha = 0.01 + 0.74 * clamp(t, 0.0, 1.0);",
+  "    gl_FragColor = vec4(color, alpha);",
   "  } else {",
   "    gl_FragColor = vec4(0.0);",
   "  }",
@@ -2684,6 +2694,7 @@ function _getProceduralConfig(method) {
           classW: { value: wArr },
           classB: { value: bArr },
           threshold: { value: isFC ? thr.fcMspGamma : thr.mspGamma },
+          maxTrainScore: { value: Math.max.apply(null, isFC ? _sortedFC.fcMspPerClass.map(function(xs) { return xs[xs.length-1]; }) : trainMsp.map(function(xs) { return Math.max.apply(null, xs); })) },
           classColors: { value: _classColorsVec3 },
           scoreMode: { value: scoreMode }
         }
@@ -2704,6 +2715,7 @@ function _getProceduralConfig(method) {
           classW: { value: wArr },
           classB: { value: bArr },
           threshold: { value: isFC ? thr.fcMlsThr : thr.mlsThr },
+          maxTrainScore: { value: Math.max.apply(null, isFC ? _sortedFC.fcMlsScores : _sortedMLSscores) },
           classColors: { value: _classColorsVec3 },
           scoreMode: { value: 1 }
         }
@@ -2724,6 +2736,7 @@ function _getProceduralConfig(method) {
           classW: { value: wArr },
           classB: { value: bArr },
           threshold: { value: isFC ? thr.fcEboThr : thr.eboThr },
+          maxTrainScore: { value: Math.max.apply(null, isFC ? _sortedFC.fcEboScores : _sortedEBOscores) },
           classColors: { value: _classColorsVec3 },
           scoreMode: { value: 2 }
         }
@@ -2748,8 +2761,9 @@ function _getProceduralConfig(method) {
           classW: { value: wArr },
           classB: { value: bArr },
           threshold: { value: isFC ? thr.fcTsGamma : thr.tsGamma },
+          maxTrainScore: { value: Math.max.apply(null, isFC ? _sortedFC.fcTsPerClass.map(function(xs) { return xs[xs.length-1]; }) : _sortedTSMSP.map(function(xs) { return xs[xs.length-1]; })) },
           classColors: { value: _classColorsVec3 },
-          scoreMode: { value: 0 }  // TS uses softmax-max like MSP
+          scoreMode: { value: 0 }
         }
       };
     }
@@ -2771,8 +2785,8 @@ function _getProceduralConfig(method) {
           classKappa: { value: kappas },
           perClassThr: { value: perThr },
           classColors: { value: _classColorsVec3 },
-          isGradient: { value: 0.0 },
-          maxTrainScores: { value: [1, 1, 1, 1, 1] }
+          isGradient: { value: 1.0 },
+          maxTrainScores: { value: classes.map(function(c) { return Math.max.apply(null, c.cosScores); }) }
         }
       };
     }
@@ -2850,6 +2864,7 @@ function _getProceduralConfig(method) {
           odinT: { value: odinT },
           odinEps: { value: odinEps },
           threshold: { value: isFC ? thr.fcOdinGamma : thr.odinGamma },
+          maxTrainScore: { value: Math.max.apply(null, (isFC ? _sortedFC.fcOdinSorted : _sortedOdinPerClass).map(function(xs) { return xs[xs.length-1]; })) },
           classColors: { value: _classColorsVec3 }
         }
       };
@@ -2875,6 +2890,7 @@ function _getProceduralConfig(method) {
           muAll: { value: new THREE.Vector3(muAll[0], muAll[1], muAll[2]) },
           vimAlphaU: { value: alphaVal },
           threshold: { value: isFC ? thr.fcVimThr : thr.vimThr },
+          maxTrainScore: { value: Math.max.apply(null, isFC ? _sortedFC.fcVimSorted : _sortedVimScores) },
           classColors: { value: _classColorsVec3 }
         }
       };
@@ -2893,6 +2909,7 @@ function _getProceduralConfig(method) {
           classMeans: { value: classes.map(function(c) { return new THREE.Vector3(c.muBar[0], c.muBar[1], c.muBar[2]); }) },
           globalMean: { value: new THREE.Vector3(muAll[0], muAll[1], muAll[2]) },
           threshold: { value: thr.rmdsThr },
+          minTrainScore: { value: _sortedRMDS[0] },
           classColors: { value: _classColorsVec3 }
         }
       };
@@ -3071,17 +3088,15 @@ var _shaderFragA = [
   "    else if (ci == 2) color = classColors[2];",
   "    else if (ci == 3) color = classColors[3];",
   "    else if (ci == 4) color = classColors[4];",
-  "    float alpha = 0.55;",
-  "    if (isGradient > 0.5) {",
+  "    float t = 0.0;",
+  "    if (invertThreshold > 0.5) {",
+  "      float denom = threshold - maxTrainScore;",
+  "      t = (abs(denom) > 0.0001) ? (threshold - score) / denom : 1.0;",
+  "    } else {",
   "      float denom = maxTrainScore - threshold;",
-  "      if (invertThreshold > 0.5) denom = threshold - maxTrainScore;",
-  "      float t = 0.0;",
-  "      if (abs(denom) > 0.0001) {",
-  "        if (invertThreshold > 0.5) t = (threshold - score) / denom;",
-  "        else t = (score - threshold) / denom;",
-  "      }",
-  "      alpha = 0.01 + 0.74 * clamp(t, 0.0, 1.0);",
+  "      t = (abs(denom) > 0.0001) ? (score - threshold) / denom : 1.0;",
   "    }",
+  "    float alpha = 0.01 + 0.74 * clamp(t, 0.0, 1.0);",
   "    gl_FragColor = vec4(color, alpha);",
   "  } else {",
   "    gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);",
@@ -3327,9 +3342,9 @@ function _getShaderPerClassThresholds(method, thr) {
 }
 
 function _getMaxTrainScore(method) {
-  // For gradient methods: the max training score (per-class for Type B)
   switch (method) {
     case "kde": return Math.max.apply(null, trainKDEscores);
+    case "knn": return Math.min.apply(null, trainKNNdists); // inverted: min distance = most in-dist
     default: return 1.0;
   }
 }
@@ -4147,24 +4162,24 @@ const cpAlphaValInput = document.getElementById("cp-alpha-val");
 const cpAlphaSlider = document.getElementById("cp-alpha");
 
 function cpApplyAlpha(val) {
-  val = Math.round(val * 100) / 100;
+  val = Math.round(val * 1000) / 1000;
   val = Math.max(0.01, Math.min(0.30, val));
   cpAlpha = val;
   cpAlphaSlider.value = val;
-  cpAlphaValInput.value = val.toFixed(2);
+  cpAlphaValInput.value = val.toFixed(3);
   updateCPDescs();
   // Fast path: procedural conformal — just update the uniform (instant)
   if (cpModes.has(activeMode)) {
     _updateConformalProceduralUniforms(activeMode);
     updateDecisionTable(activeMode);
+    desc.textContent = descs[activeMode] || descs.none;
   }
 }
 
 // Fire cpApplyAlpha on every slider input event (while dragging).
-// When the shader cache has the score field, this is instant (uniform update only).
 cpAlphaSlider.addEventListener("input", function() {
   var val = parseFloat(this.value);
-  cpAlphaValInput.value = val.toFixed(2);
+  cpAlphaValInput.value = val.toFixed(3);
   cpApplyAlpha(val);
 });
 cpAlphaSlider.addEventListener("change", function() {
@@ -4173,11 +4188,11 @@ cpAlphaSlider.addEventListener("change", function() {
 
 cpAlphaValInput.addEventListener("keydown", function(e) {
   if (e.key === "Enter") { this.blur(); }
-  if (e.key === "Escape") { this.value = cpAlpha.toFixed(2); this.blur(); }
+  if (e.key === "Escape") { this.value = cpAlpha.toFixed(3); this.blur(); }
 });
 cpAlphaValInput.addEventListener("blur", function() {
   const val = parseFloat(this.value);
-  if (isNaN(val)) { this.value = cpAlpha.toFixed(2); return; }
+  if (isNaN(val)) { this.value = cpAlpha.toFixed(3); return; }
   cpApplyAlpha(val);
 });
 
@@ -4344,11 +4359,11 @@ function updateQDescs() {
 updateQDescs();
 
 function applyQ(val) {
-  val = Math.round(val * 100) / 100;
-  val = Math.max(0.01, Math.min(0.20, val));
+  val = Math.round(val * 1000) / 1000;
+  val = Math.max(0.01, Math.min(0.30, val));
   currentQ = val;
   qSlider.value = val;
-  qValInput.value = val.toFixed(2);
+  qValInput.value = val.toFixed(3);
   cachedThr = allThresholds(val);
   updateQDescs();
   updateFCDescs();
@@ -4360,20 +4375,19 @@ function applyQ(val) {
 }
 
 // Fire applyQ on every slider input event (while dragging), not just change.
-// When the shader cache has the score field, this is instant (uniform update only).
 qSlider.addEventListener("input", function() {
   var val = parseFloat(this.value);
-  qValInput.value = val.toFixed(2);
+  qValInput.value = val.toFixed(3);
   applyQ(val);
 });
 qSlider.addEventListener("change", function() { applyQ(parseFloat(this.value)); });
 qValInput.addEventListener("keydown", function(e) {
   if (e.key === "Enter") this.blur();
-  if (e.key === "Escape") { this.value = currentQ.toFixed(2); this.blur(); }
+  if (e.key === "Escape") { this.value = currentQ.toFixed(3); this.blur(); }
 });
 qValInput.addEventListener("blur", function() {
   const v = parseFloat(this.value);
-  if (isNaN(v)) { this.value = currentQ.toFixed(2); return; }
+  if (isNaN(v)) { this.value = currentQ.toFixed(3); return; }
   applyQ(v);
 });
 
@@ -4394,10 +4408,10 @@ qPlayBtn.addEventListener("click", function() {
   qPlayBtn.innerHTML = "\u23F8";
   function step() {
     if (!_qPlaying) return;
-    var next = Math.round((currentQ + 0.01) * 100) / 100;
-    if (next > 0.20) next = 0.01;
+    var next = Math.round((currentQ + 0.001) * 1000) / 1000;
+    if (next > 0.30) next = 0.01;
     applyQ(next);
-    _qPlayTimer = setTimeout(step, 1500);
+    _qPlayTimer = setTimeout(step, 33);
   }
   step();
 });
@@ -4413,10 +4427,10 @@ alphaPlayBtn.addEventListener("click", function() {
   alphaPlayBtn.innerHTML = "\u23F8";
   function step() {
     if (!_alphaPlaying) return;
-    var next = Math.round((cpAlpha + 0.01) * 100) / 100;
+    var next = Math.round((cpAlpha + 0.001) * 1000) / 1000;
     if (next > 0.30) next = 0.01;
     cpApplyAlpha(next);
-    _alphaPlayTimer = setTimeout(step, 1500);
+    _alphaPlayTimer = setTimeout(step, 33);
   }
   step();
 });
