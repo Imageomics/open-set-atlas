@@ -14,6 +14,7 @@ let dragging = false, panning = false, px = 0, py = 0;
 let rotY = 0.5, rotX = 0.3;
 let clickStartX = 0, clickStartY = 0;
 let rotSpeed = 0.002;
+let _savedRotSpeed = 0.002;
 const ROT_MAX = 0.002;
 
 let _raycaster, _pointerNDC;
@@ -100,6 +101,20 @@ function _onPointerUp(e) {
   dragging = false; panning = false;
   _container.style.cursor = "grab";
   if (wasDrag) return;
+  // Right-click: toggle rotation pause/resume
+  if (e.button === 2) {
+    if (rotSpeed === 0) {
+      rotSpeed = _savedRotSpeed || ROT_MAX;
+    } else {
+      _savedRotSpeed = rotSpeed;
+      rotSpeed = 0;
+    }
+    const rs = document.getElementById("rot-speed");
+    const rv = document.getElementById("rot-speed-val");
+    if (rs) rs.value = Math.round((rotSpeed / ROT_MAX) * 100);
+    if (rv) rv.value = (rotSpeed / ROT_MAX).toFixed(1);
+    return;
+  }
   if (e.button !== 0) return;
   const rect = _renderer.domElement.getBoundingClientRect();
   _pointerNDC.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
