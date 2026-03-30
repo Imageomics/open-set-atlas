@@ -22,7 +22,14 @@ APS, 1-MSP, and Embedding cosine score functions with adjustable coverage level 
 
 ## Usage
 
-Open `ood_methods_3d.html` in a browser. Three.js loads from a CDN (requires internet on first load).
+Serve over HTTP (ES modules require it) and open `ood_methods_3d.html`:
+
+```bash
+npx serve .
+# → http://localhost:3000/ood_methods_3d.html
+```
+
+Three.js loads from a CDN (requires internet on first load).
 
 **Controls:**
 - Click a method button to see its acceptance region on the sphere
@@ -37,6 +44,26 @@ Open `ood_methods_3d.html` in a browser. Three.js loads from a CDN (requires int
 **Precomputed data:** `precomputed.js` (128 KB) provides class data, FC weights, and training scores so the browser skips sampling, FC training, and KNN distance computation. Textures are computed client-side on demand.
 
 To regenerate precomputed data: `node precompute.js`
+
+## Development
+
+All JavaScript lives in `src/` as ES modules. The HTML is pure markup.
+
+```
+src/
+├── main.js                 — composition root (data init, wiring)
+├── config/                 — method registry, constants, class definitions
+├── state/                  — reactive state, FC effect cascade, threshold engine
+├── methods/                — scoring, uniforms, FC trainer, conformal logic
+├── rendering/              — shader manager, orbit controls, ellipsoids
+├── ui/                     — controls, decision table
+├── math/                   — vec3, linalg, stats, sampling, fitting
+└── shaders/                — GLSL fragment shaders as JS strings
+```
+
+```bash
+node --test test/unit/*.test.js   # 190 tests
+```
 
 ## License
 
