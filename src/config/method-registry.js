@@ -1,5 +1,3 @@
-"use strict";
-
 // ═══════════════════════════════════════════════════════════════════
 //  Method registry: the single data structure that defines every
 //  OOD detection method's behavior.
@@ -14,21 +12,12 @@
 //    - Rendering: renderKind, shaderKey, buildUniforms, isGradient
 //    - Threshold: shape, inverted, getThreshold, getPerClassThresholds
 //    - Cache: cacheKey computation
-//    - Scoring: CPU-side score/decide/classScores functions
-//    - Description: template function
-//
-//  This replaces:
-//    - oodDecision3d (186-line switch, html:3534-3720)
-//    - classScores3d (switch, html:3725-3777)
-//    - _getProceduralConfig (280-line switch, html:2677-2960)
-//    - _updateProceduralUniforms (switch, html:2950-2999)
-//    - _getShaderThreshold (switch, html:3314-3332)
-//    - _getShaderPerClassThresholds (switch, html:3335-3344)
-//    - _isInvertedThreshold (html:3374-3376)
-//    - _shaderTypeB set (html:2149)
-//    - _shaderGradient set (html:2151)
-//    - methodNames object (html:3523-3531)
+//    - Scoring: decideFn, classScoresFn, scoreFn (from scoring.js)
+//    - Description: template function (Phase 5)
 // ═══════════════════════════════════════════════════════════════════
+
+import { methodScoring } from '../methods/scoring.js';
+import { methodUniforms } from '../methods/uniforms.js';
 
 // ─── Render kinds ────────────────────────────────────────────────
 // "procedural"  — GPU shader computes score from direction. Uniform
@@ -111,8 +100,8 @@ defProtoFC({
   thresholdShape: "single",
   getThreshold: null, // set per-variant below
 }, {
-  proto: { getThreshold: thr => thr.mspGamma },
-  fc:    { getThreshold: thr => thr.fcMspGamma },
+  proto: { getThreshold: thr => thr.mspGamma, ...methodScoring["msp"], ...methodUniforms["msp"] },
+  fc:    { getThreshold: thr => thr.fcMspGamma, ...methodScoring["fc-msp"], ...methodUniforms["fc-msp"] },
 });
 
 defProtoFC({
@@ -122,8 +111,8 @@ defProtoFC({
   shaderKey: "logit",
   thresholdShape: "single",
 }, {
-  proto: { getThreshold: thr => thr.mlsThr },
-  fc:    { getThreshold: thr => thr.fcMlsThr },
+  proto: { getThreshold: thr => thr.mlsThr, ...methodScoring["mls"], ...methodUniforms["mls"] },
+  fc:    { getThreshold: thr => thr.fcMlsThr, ...methodScoring["fc-mls"], ...methodUniforms["fc-mls"] },
 });
 
 defProtoFC({
@@ -133,8 +122,8 @@ defProtoFC({
   shaderKey: "logit",
   thresholdShape: "single",
 }, {
-  proto: { getThreshold: thr => thr.eboThr },
-  fc:    { getThreshold: thr => thr.fcEboThr },
+  proto: { getThreshold: thr => thr.eboThr, ...methodScoring["ebo"], ...methodUniforms["ebo"] },
+  fc:    { getThreshold: thr => thr.fcEboThr, ...methodScoring["fc-ebo"], ...methodUniforms["fc-ebo"] },
 });
 
 defProtoFC({
@@ -144,8 +133,8 @@ defProtoFC({
   shaderKey: "logit",
   thresholdShape: "single",
 }, {
-  proto: { getThreshold: thr => thr.tsGamma },
-  fc:    { getThreshold: thr => thr.fcTsGamma },
+  proto: { getThreshold: thr => thr.tsGamma, ...methodScoring["ts"], ...methodUniforms["ts"] },
+  fc:    { getThreshold: thr => thr.fcTsGamma, ...methodScoring["fc-ts"], ...methodUniforms["fc-ts"] },
 });
 
 defProtoFC({
@@ -156,8 +145,8 @@ defProtoFC({
   thresholdShape: "single",
   isGradient: true,
 }, {
-  proto: { getThreshold: thr => thr.odinGamma },
-  fc:    { getThreshold: thr => thr.fcOdinGamma },
+  proto: { getThreshold: thr => thr.odinGamma, ...methodScoring["odin"], ...methodUniforms["odin"] },
+  fc:    { getThreshold: thr => thr.fcOdinGamma, ...methodScoring["fc-odin"], ...methodUniforms["fc-odin"] },
 });
 
 defProtoFC({
@@ -168,8 +157,8 @@ defProtoFC({
   thresholdShape: "single",
   isGradient: true,
 }, {
-  proto: { getThreshold: thr => thr.vimThr },
-  fc:    { getThreshold: thr => thr.fcVimThr },
+  proto: { getThreshold: thr => thr.vimThr, ...methodScoring["vim"], ...methodUniforms["vim"] },
+  fc:    { getThreshold: thr => thr.fcVimThr, ...methodScoring["fc-vim"], ...methodUniforms["fc-vim"] },
 });
 
 // ═══════════════════════════════════════════════════════════════════
@@ -183,8 +172,8 @@ defProtoFC({
   shaderKey: "cos-vmf",
   thresholdShape: "perClass",
 }, {
-  proto: { getPerClassThresholds: thr => thr.cosPerClass },
-  fc:    { getPerClassThresholds: thr => thr.fcCosPerClass },
+  proto: { getPerClassThresholds: thr => thr.cosPerClass, ...methodScoring["cos"], ...methodUniforms["cos"] },
+  fc:    { getPerClassThresholds: thr => thr.fcCosPerClass, ...methodScoring["fc-cos"], ...methodUniforms["fc-cos"] },
 });
 
 defProtoFC({
@@ -195,8 +184,8 @@ defProtoFC({
   thresholdShape: "bands",
   isGradient: true,
 }, {
-  proto: { getPerClassThresholds: thr => thr.vmfBands.map(b => b[0]) },
-  fc:    { getPerClassThresholds: thr => thr.fcVmfBands.map(b => b[0]) },
+  proto: { getPerClassThresholds: thr => thr.vmfBands.map(b => b[0]), ...methodScoring["vmf"], ...methodUniforms["vmf"] },
+  fc:    { getPerClassThresholds: thr => thr.fcVmfBands.map(b => b[0]), ...methodScoring["fc-vmf"], ...methodUniforms["fc-vmf"] },
 });
 
 defProtoFC({
@@ -207,8 +196,8 @@ defProtoFC({
   thresholdShape: "bands",
   isGradient: true,
 }, {
-  proto: { getPerClassThresholds: thr => thr.kentBands.map(b => b[0]) },
-  fc:    { getPerClassThresholds: thr => thr.fcKentBands.map(b => b[0]) },
+  proto: { getPerClassThresholds: thr => thr.kentBands.map(b => b[0]), ...methodScoring["kent"], ...methodUniforms["kent"] },
+  fc:    { getPerClassThresholds: thr => thr.fcKentBands.map(b => b[0]), ...methodScoring["fc-kent"], ...methodUniforms["fc-kent"] },
 });
 
 // ═══════════════════════════════════════════════════════════════════
@@ -230,6 +219,7 @@ def({
   getThreshold: thr => thr.mahalPCThr,
   getPerClassThresholds: null,
   cacheKey: () => "mds",
+  ...methodScoring["mds"],
 });
 
 def({
@@ -247,6 +237,7 @@ def({
   getThreshold: thr => thr.mahalSThr,
   getPerClassThresholds: null,
   cacheKey: () => "mds-s",
+  ...methodScoring["mds-s"],
 });
 
 def({
@@ -264,6 +255,8 @@ def({
   getThreshold: thr => thr.rmdsThr,
   getPerClassThresholds: null,
   cacheKey: () => "rmds",
+  ...methodScoring["rmds"],
+  ...methodUniforms["rmds"],
 });
 
 def({
@@ -281,6 +274,7 @@ def({
   getThreshold: thr => thr.knnThr,
   getPerClassThresholds: null,
   cacheKey: () => "knn",
+  ...methodScoring["knn"],
 });
 
 def({
@@ -298,6 +292,7 @@ def({
   getThreshold: thr => thr.kdeThr,
   getPerClassThresholds: null,
   cacheKey: () => "kde",
+  ...methodScoring["kde"],
 });
 
 // ═══════════════════════════════════════════════════════════════════
