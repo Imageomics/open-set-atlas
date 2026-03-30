@@ -62,9 +62,14 @@ src/
 ```
 
 ```bash
-node --test test/unit/*.test.js   # 190 tests
+node --test test/unit/*.test.js
 ```
 
 ## License
 
 MIT
+
+## AI Attribution
+This repository also serves as a testing ground for exploring the opportunities and perils of agentic AI software development at a greater degree of autonomy. Almost all of the code, architectural planning, and test design here is AI-generated across multiple sessions. The human role has been managerial, spanning 'helicopter' micromanagement to Laissez-faire task assignment with acceptance as long as nothing clearly breaks. Tools used include Claude Code CLI (Opus 4.6), Codex CLI (gpt-5.4), and Claude web (Opus 4.6).
+
+This workflow intentionally operates at a higher degree of AI autonomy than a typical human-in-the-loop development cycle, where the human would review and revise all output. Here, human oversight is concentrated on steering and testing/acceptance decisions rather than at code authorship level. This is an active experiment to test the tradeoff between velocity and hallucination, and whether the former can be leveraged while practicing strategies to mitigate the latter.
